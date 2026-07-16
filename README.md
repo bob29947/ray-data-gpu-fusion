@@ -26,9 +26,9 @@ actions.
 - `environment/` and `pins/` make the runtime and source provenance repeatable.
 - `scripts/` builds the derived Ray wheel and validates the installation.
 
-See [`docs/architecture.md`](docs/architecture.md) for the execution and GPU
-handoff design and [`docs/phase-0.md`](docs/phase-0.md) for the exact support
-matrix.
+See [`docs/design.md`](docs/design.md) for the complete proposal,
+[`docs/architecture.md`](docs/architecture.md) for a compact execution summary,
+and [`docs/phase-0.md`](docs/phase-0.md) for the exact support matrix.
 
 ## Phase 0 scope
 
