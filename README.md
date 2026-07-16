@@ -68,7 +68,12 @@ import ray_data_gpu_fusion as rgf
 rgf.enable()
 
 result = (
-    ray.data.read_parquet("/shared/data", columns=["a", "b"])
+    # One-file Phase-0 example: avoid a stock post-read SplitBlocks node.
+    ray.data.read_parquet(
+        "/shared/data/input.parquet",
+        columns=["a", "b"],
+        override_num_blocks=1,
+    )
     .map_batches(
         MyGpuTransform,
         batch_format="cudf",

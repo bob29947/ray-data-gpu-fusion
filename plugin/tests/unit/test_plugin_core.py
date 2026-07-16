@@ -274,7 +274,14 @@ def test_read_with_stock_additional_split_factor_stays_stock(monkeypatch):
         datasource_or_legacy_reader=datasource,
         parallelism=4,
     )
-    plan = PhysicalPlan(physical_read, {physical_read: logical_read}, context)
+    # Public read plans map both the InputDataBuffer and its read MapOperator
+    # to the logical Read. Lowering must recognize only the MapOperator as the
+    # replaceable closure and leave the source node alone during recursion.
+    plan = PhysicalPlan(
+        physical_read,
+        {source: logical_read, physical_read: logical_read},
+        context,
+    )
     monkeypatch.setattr(
         rules,
         "read_eligibility",

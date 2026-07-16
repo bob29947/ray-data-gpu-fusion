@@ -31,7 +31,7 @@ def main() -> int:
 
     ray.init()
     rgf.enable(fusion=not args.no_fusion)
-    dataset = ray.data.read_parquet(args.input).map_batches(
+    dataset = ray.data.read_parquet(args.input, override_num_blocks=1).map_batches(
         AddFeatures,
         fn_constructor_kwargs={"multiplier": 3},
         batch_format="cudf",

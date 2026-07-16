@@ -530,10 +530,14 @@ class LowerClosedGPUOperators(Rule):
                         # planning capability check. Preserve the exact stock
                         # operator just as a backend factory refusal would.
                         eligibility = _decline(str(error))
-            elif type(logical) is Read:
+            elif type(logical) is Read and hasattr(
+                operator, "get_additional_split_factor"
+            ):
                 # A logical source has no logical inputs, but stock Ray lowers
                 # it to ``InputDataBuffer -> MapOperator``.  Replace that whole
-                # physical closure, not only zero-input physical nodes.
+                # physical closure at the MapOperator. The InputDataBuffer is
+                # also mapped to the logical Read in Ray's op_map, so the
+                # method check is part of recognizing the physical shape.
                 additional_split_factor = operator.get_additional_split_factor()
                 if additional_split_factor > 1:
                     # SetReadParallelismRule uses this stock physical split to

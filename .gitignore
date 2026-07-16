@@ -9,3 +9,4 @@ build/
 benchmark/results/
 .coverage
 coverage.xml
+cufile.log

@@ -4,7 +4,7 @@
 
 | Ray Data shape | Phase-0 requirement | Result |
 | --- | --- | --- |
-| `read_parquet()` | Legacy V1 Parquet datasource; ordinary local/shared path or ambient-credential S3; unordered execution with no predicate, partition columns, custom filesystem, schema override, shuffle, read callback, or extra stock split factor | Exact row-group cuDF read candidate |
+| `read_parquet()` | Legacy V1 Parquet datasource; ordinary local/shared path or ambient-credential S3; unordered execution with no predicate, partition columns, custom filesystem, schema override, shuffle, read callback, or extra stock split factor (`additional_split_factor == 1`) | Exact row-group cuDF read candidate |
 | `map_batches()` | Exact `MapBatches`; synchronous callable; explicit positive integer `batch_size`; `batch_format="cudf"`; finite actor pool; one GPU and one in-flight task per actor | Standalone GPU actor candidate and native fusion transform |
 | Linear compatible chain | Matching execution and payload contracts | One fused Ray actor-pool operator |
 | Linear incompatible chain | Any contract differs | Separate demand-driven Ray actor pools with Arrow blocks between them |
@@ -37,7 +37,9 @@ ray.init()
 rgf.enable()
 
 ds = (
-    ray.data.read_parquet("/shared/input")
+    # For this one-file example, requesting one block avoids Ray inserting a
+    # stock post-read SplitBlocks node, which Phase 0 deliberately declines.
+    ray.data.read_parquet("/shared/input.parquet", override_num_blocks=1)
     .map_batches(
         MyTransform,
         batch_format="cudf",

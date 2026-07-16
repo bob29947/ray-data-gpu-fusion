@@ -31,18 +31,29 @@ def _child(mode: str, parquet: str) -> int:
     import ray.data
 
     ray.init(num_cpus=4, num_gpus=1, include_dashboard=False)
+    rgf = None
     if mode == "plugin":
         import ray_data_gpu_fusion as rgf
 
         rgf.enable()
 
-    dataset = ray.data.read_parquet(parquet).map_batches(
+    dataset = ray.data.read_parquet(parquet, override_num_blocks=1).map_batches(
         AddFeatures,
         batch_format="cudf",
         batch_size=4096,
         compute=ray.data.ActorPoolStrategy(size=1),
         num_gpus=1,
     )
+    fused = False
+    if rgf is not None:
+        explanation = rgf.explain(dataset)
+        required = ("GPU fused:", "'read_parquet'", "'map_batches'")
+        if not all(value in explanation for value in required):
+            raise RuntimeError(
+                "plugin benchmark did not produce the expected fused plan:\n"
+                + explanation
+            )
+        fused = True
     started = time.perf_counter()
     table = dataset.materialize().to_arrow_refs()
     blocks = ray.get(table)
@@ -59,6 +70,7 @@ def _child(mode: str, parquet: str) -> int:
                 "rows": combined.num_rows,
                 "digest": digest,
                 "elapsed_s": elapsed,
+                "fused": fused,
                 "stats": dataset.stats(),
             },
             sort_keys=True,
@@ -93,13 +105,18 @@ def _orchestrate() -> int:
         )
         results = []
         for mode in ("stock", "plugin"):
-            completed = subprocess.run(
-                [sys.executable, __file__, "--child", mode, str(path)],
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, __file__, "--child", mode, str(path)],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(
+                    f"{mode} benchmark child failed:\n{error.stdout}"
+                ) from error
             results.append(_parse_result(completed.stdout))
         if results[0]["digest"] != results[1]["digest"]:
             raise RuntimeError(f"stock/plugin result mismatch: {results}")
