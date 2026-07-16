@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ray-data-gpu-fusion"
+version = "0.1.0.dev0"
+description = "Modular closed GPU operators and opportunistic fusion for Ray Data"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "ray[data]==3.0.0.dev0",
+    "pyarrow>=19,<20",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<9"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ray_data_gpu_fusion = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu: requires a visible CUDA GPU and the pinned RAPIDS runtime",
+    "s3: requires ambient AWS credentials, KvikIO, and a real S3 source",
+]

@@ -1,0 +1,20 @@
+name: ray-data-gpu-fusion
+# Reviewed solver input only. Bootstrap uses the separate realized
+# `conda list --explicit` lock and records its SHA-256; this file is not a lock.
+channels:
+  - rapidsai
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.11
+  - cuda-version=12.2
+  - cudf=25.12
+  - cupy=13.6
+  - numpy=2.0
+  - pyarrow=19.0
+  # Optional for the direct S3 adapter; not present in the checked-in realized
+  # local-validation lock.
+  # - kvikio=25.12
+  - rapidsmpf=25.12
+  - ucxx=0.47
+  - pytest=8.4

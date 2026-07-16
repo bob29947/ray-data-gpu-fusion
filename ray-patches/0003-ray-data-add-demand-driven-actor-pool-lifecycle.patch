@@ -1,0 +1,303 @@
+From c5416645192298032452a371b54a4815fcfe5ee5 Mon Sep 17 00:00:00 2001
+From: Phase0 Builder <phase0@example.invalid>
+Date: Thu, 16 Jul 2026 20:54:47 +0000
+Subject: [PATCH 3/3] ray data: add demand-driven actor pool lifecycle
+
+---
+ .../default_actor_autoscaler.py               |   6 +
+ .../operators/actor_pool_map_operator.py      | 159 +++++++++++++++++-
+ 2 files changed, 157 insertions(+), 8 deletions(-)
+
+diff --git a/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py b/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
+index b24bb40c2d..8fbaa5e13a 100644
+--- a/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
++++ b/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
+@@ -64,6 +64,12 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+                 delta=-num_to_scale_down, force=True, reason="consumed all inputs"
+             )
+ 
++        # Demand-driven pools deliberately begin below their configured minimum.
++        # The operator requests initial actors after input demand (and any requested
++        # upstream handoff), so autoscaling must not eagerly restore the minimum.
++        if getattr(op, "actor_pool_start_deferred", False):
++            return ActorPoolScalingRequest.no_op(reason="waiting for input demand")
++
+         if actor_pool.current_size() < actor_pool.min_size():
+             # Scale up, if the actor pool is below min size.
+             return ActorPoolScalingRequest.upscale(
+diff --git a/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py b/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
+index 76afc11e4e..5541abb92b 100644
+--- a/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
++++ b/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
+@@ -118,6 +118,9 @@ class ActorPoolMapOperator(MapOperator):
+         target_max_block_size_override: Optional[int] = None,
+         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
+         default_logical_memory_enabled: bool = False,
++        defer_actor_start: bool = False,
++        wait_for_upstream_deferred_operators: bool = False,
++        release_idle_actors_on_completion: bool = False,
+     ):
+         """Create an ActorPoolMapOperator instance.
+ 
+@@ -152,6 +155,13 @@ class ActorPoolMapOperator(MapOperator):
+             default_logical_memory_enabled: If ``True``, the operator launches actors
+                 with a default logical ``memory``. The method for choosing the
+                 default is an implementation detail.
++            defer_actor_start: If ``True``, create the pool during ``start()`` but
++                request its initial actors only after input demand arrives.
++            wait_for_upstream_deferred_operators: With deferred startup, queue input
++                until upstream demand-driven actor operators finish execution. This
++                lets sequential pools hand scarce resources to one another.
++            release_idle_actors_on_completion: Force-release idle pool actors once
++                input and queued work have drained.
+         """
+         super().__init__(
+             map_transformer,
+@@ -187,6 +197,19 @@ class ActorPoolMapOperator(MapOperator):
+         self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
+ 
+         self._actor_pool = self._create_actor_pool(compute_strategy)
++        self._defer_actor_start = bool(defer_actor_start)
++        self._wait_for_upstream_deferred_operators = bool(
++            wait_for_upstream_deferred_operators
++        )
++        self._release_idle_actors_on_completion = bool(
++            release_idle_actors_on_completion
++        )
++        if self._wait_for_upstream_deferred_operators and not self._defer_actor_start:
++            raise ValueError(
++                "waiting for upstream deferred operators requires deferred "
++                "actor startup"
++            )
++        self._actors_requested = False
+         # A queue of bundles awaiting dispatch to actors.
+         self._bundle_queue = create_bundle_queue()
+         # Cached actor class.
+@@ -276,17 +299,14 @@ class ActorPoolMapOperator(MapOperator):
+         super().start(options, block_ref_counter)
+ 
+         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
+-        self._actor_pool.scale(
+-            ActorPoolScalingRequest(
+-                delta=self._actor_pool.initial_size(), reason="scaling to initial size"
+-            )
+-        )
++        if not self._defer_actor_start:
++            self._ensure_actor_pool_started()
+ 
+         # If `wait_for_min_actors_s` is specified and is positive, then
+         # Actor Pool will block until min number of actors is provisioned.
+         #
+         # Otherwise, all actors will be provisioned asynchronously.
+-        if self.data_context.wait_for_min_actors_s > 0:
++        if not self._defer_actor_start and self.data_context.wait_for_min_actors_s > 0:
+             refs = self._actor_pool.get_pending_actor_refs()
+ 
+             logger.debug(
+@@ -304,6 +324,77 @@ class ActorPoolMapOperator(MapOperator):
+                     "enough resources for the requested actor pool."
+                 )
+ 
++    @property
++    def defer_actor_start(self) -> bool:
++        """Whether input demand activates this operator's actor pool."""
++
++        return self._defer_actor_start
++
++    @property
++    def actor_pool_start_deferred(self) -> bool:
++        """Whether the actor pool is still intentionally below its minimum."""
++
++        return self._defer_actor_start and not self._actors_requested
++
++    def configure_demand_driven_start(
++        self,
++        *,
++        wait_for_upstream_deferred_operators: bool = True,
++        release_idle_actors_on_completion: bool = True,
++    ) -> None:
++        """Enable demand-driven lifecycle before execution starts.
++
++        Physical optimizer extensions can use this method to configure an
++        already-planned stock actor map without rebuilding its MapTransformer.
++        """
++
++        if self._started:
++            raise RuntimeError(
++                "demand-driven actor startup must be configured before start()"
++            )
++        self._defer_actor_start = True
++        self._wait_for_upstream_deferred_operators = bool(
++            wait_for_upstream_deferred_operators
++        )
++        self._release_idle_actors_on_completion = bool(
++            release_idle_actors_on_completion
++        )
++
++    def _ensure_actor_pool_started(self) -> bool:
++        if self._actors_requested:
++            return True
++        if (
++            self._wait_for_upstream_deferred_operators
++            and not self._upstream_deferred_operators_finished()
++        ):
++            return False
++        if self._actor_cls is None:
++            raise RuntimeError("actor pool cannot start before operator.start()")
++        self._actors_requested = True
++        self._actor_pool.scale(
++            ActorPoolScalingRequest(
++                delta=self._actor_pool.initial_size(),
++                reason="input demand" if self._defer_actor_start else "initial size",
++            )
++        )
++        return True
++
++    def _upstream_deferred_operators_finished(self) -> bool:
++        visited = set()
++        stack = list(self.input_dependencies)
++        while stack:
++            operator = stack.pop()
++            if operator in visited:
++                continue
++            visited.add(operator)
++            if (
++                getattr(operator, "defer_actor_start", False)
++                and not operator.has_execution_finished()
++            ):
++                return False
++            stack.extend(operator.input_dependencies)
++        return True
++
+     def can_add_input(self) -> bool:
+         """NOTE: PLEASE READ CAREFULLY
+ 
+@@ -315,6 +406,11 @@ class ActorPoolMapOperator(MapOperator):
+             should be able to launch a task.
+ 
+         """
++        if self._defer_actor_start and not self._actors_requested:
++            # Admit the first bundle even though no actor exists yet. When waiting
++            # for an upstream demand-driven pool, subsequent bundles can spool here
++            # while that upstream region finishes and releases its resources.
++            return True
+         return self._actor_pool.can_schedule_task()
+ 
+     def _start_actor(
+@@ -359,6 +455,9 @@ class ActorPoolMapOperator(MapOperator):
+             if not has_actor:
+                 # Actor has already been killed.
+                 return
++            # A deferred pool can queue work before an actor exists. Dispatch as
++            # soon as any actor is ready; never wait for the full configured pool.
++            self._try_schedule_tasks_internal()
+ 
+         self._submit_metadata_task(
+             res_ref,
+@@ -373,7 +472,14 @@ class ActorPoolMapOperator(MapOperator):
+         self._bundle_queue.add(bundle)
+         self._metrics.on_input_queued(bundle, input_index=0)
+ 
+-        if strict:
++        if self._defer_actor_start:
++            self._ensure_actor_pool_started()
++
++        deferred_start_pending = (
++            self._defer_actor_start and self._actor_pool.num_running_actors() == 0
++        )
++
++        if strict and not deferred_start_pending:
+             # NOTE: In case of strict input handling protocol at least 1 task
+             #       must be launched. Therefore, we assert here that it was
+             #       verified that the task could be scheduled before invoking
+@@ -383,7 +489,7 @@ class ActorPoolMapOperator(MapOperator):
+         # Try to dispatch new tasks
+         submitted = self._try_schedule_tasks_internal()
+ 
+-        if strict:
++        if strict and not deferred_start_pending:
+             assert (
+                 submitted >= 1
+             ), f"Expected at least 1 task launched (launched {submitted})"
+@@ -430,6 +536,7 @@ class ActorPoolMapOperator(MapOperator):
+             def _task_done_callback(actor_to_return):
+                 # Return the actor that was running the task to the pool.
+                 self._actor_pool.on_task_completed(actor_to_return)
++                self._release_idle_actors_if_complete()
+ 
+             from functools import partial
+ 
+@@ -469,6 +576,13 @@ class ActorPoolMapOperator(MapOperator):
+     def has_next(self) -> bool:
+         # In case there are still enqueued bundles remaining, try to
+         # dispatch tasks.
++        if (
++            self._defer_actor_start
++            and not self._actors_requested
++            and self._bundle_queue.num_blocks() > 0
++            and self._ensure_actor_pool_started()
++        ):
++            self._try_schedule_tasks_internal()
+         if self._inputs_complete and self._bundle_queue.num_blocks() > 0:
+             # NOTE: That no more than 1 bundle is expected to be in the queue
+             #       upon inputs completion (the one that was pending in the bundler)
+@@ -488,6 +602,10 @@ class ActorPoolMapOperator(MapOperator):
+         # trigger task dispatch.
+         super().all_inputs_done()
+ 
++        # A final task can finish before the executor delivers all-inputs-done,
++        # leaving no later callback to release actors that are already idle.
++        self._release_idle_actors_if_complete()
++
+         if self._metrics.num_inputs_received < self._actor_pool.min_size():
+             warnings.warn(
+                 f"The minimum number of concurrent actors for '{self.name}' is set to "
+@@ -499,6 +617,27 @@ class ActorPoolMapOperator(MapOperator):
+                 "configuring `override_num_blocks` earlier in the pipeline."
+             )
+ 
++    def _release_idle_actors_if_complete(self) -> None:
++        if (
++            not self._release_idle_actors_on_completion
++            or not self._inputs_complete
++            or self._bundle_queue.num_blocks() != 0
++            or self._block_ref_bundler.estimate_size_bytes() != 0
++        ):
++            return
++
++        current_size = self._actor_pool.current_size()
++        if current_size:
++            # Pool downscaling only removes pending or idle actors. Active actors
++            # remain until their completion callback invokes this method again.
++            self._actor_pool.scale(
++                ActorPoolScalingRequest.downscale(
++                    delta=-current_size,
++                    force=True,
++                    reason="operator input completed",
++                )
++            )
++
+     def _do_shutdown(self, force: bool = False):
+         self._actor_pool.shutdown(force=force)
+         # NOTE: It's critical for Actor Pool to release actors before calling into
+@@ -517,6 +656,8 @@ class ActorPoolMapOperator(MapOperator):
+         self,
+     ) -> Tuple[ExecutionResources, ExecutionResources]:
+         min_actors = self._actor_pool.min_size()
++        if self._defer_actor_start and not self._actors_requested:
++            min_actors = 0
+         max_actors = self._actor_pool.max_size()
+         assert min_actors is not None, min_actors
+ 
+@@ -609,6 +750,8 @@ class ActorPoolMapOperator(MapOperator):
+         return per_actor_resource_usage.scale(1 / max_concurrency)
+ 
+     def min_scheduling_resources(self) -> ExecutionResources:
++        if self._defer_actor_start and not self._actors_requested:
++            return ExecutionResources.zero()
+         return self._actor_pool.per_actor_resource_usage()
+ 
+     def refresh_state(self):
+-- 
+2.34.1
+

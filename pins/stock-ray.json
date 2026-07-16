@@ -1,0 +1,9 @@
+{
+  "commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+  "version": "3.0.0.dev0",
+  "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
+  "wheel_sha256": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
+  "wheel_size_bytes": 40320159,
+  "python": "3.11",
+  "platform": "linux_x86_64"
+}

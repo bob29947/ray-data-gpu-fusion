@@ -1,0 +1,9 @@
+{
+  "source_project": "/raid/spark-team/bobbwang/projects/ray-gpu-operator-fusion/ray-modified",
+  "base_commit": "0f8d51b7d03f25a37cd7f20d1436f439e5a5b718",
+  "stock_ancestor": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+  "working_tree_entries": 57,
+  "binary_diff_sha256": "0e4097d745b7521da0829ed1e773e8f4b7631944aac3afd1127fbcab52eadae3",
+  "untracked_file_hash_stream_sha256": "0e342ba7be0d84019b27e5213c9b571048929b8cfc0a63bca33aae6451c56ab7",
+  "note": "The dirty working tree, not the older installed modified wheel, is the source for the opportunistic closed-operator extraction."
+}

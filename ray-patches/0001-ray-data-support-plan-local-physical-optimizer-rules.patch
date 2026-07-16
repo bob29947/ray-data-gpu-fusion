@@ -1,0 +1,77 @@
+From d3515e0d27c77e9e0a713a09974c5f88449bc3b5 Mon Sep 17 00:00:00 2001
+From: Phase0 Builder <phase0@example.invalid>
+Date: Thu, 16 Jul 2026 20:47:05 +0000
+Subject: [PATCH 1/3] ray data: support plan-local physical optimizer rules
+
+---
+ .../ray/data/_internal/logical/optimizers.py  | 25 ++++++++++++++++++-
+ python/ray/data/context.py                    |  8 ++++++
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/python/ray/data/_internal/logical/optimizers.py b/python/ray/data/_internal/logical/optimizers.py
+index 8097db4bbe..76c7a4a4bd 100644
+--- a/python/ray/data/_internal/logical/optimizers.py
++++ b/python/ray/data/_internal/logical/optimizers.py
+@@ -71,9 +71,32 @@ class LogicalOptimizer(Optimizer):
+ class PhysicalOptimizer(Optimizer):
+     """The optimizer for physical operators."""
+ 
++    def __init__(self):
++        self._custom_rule_classes = ()
++
+     @property
+     def rules(self) -> List[Rule]:
+-        return [rule_cls() for rule_cls in get_physical_ruleset()]
++        ruleset = Ruleset()
++        seen = set()
++        for rule_cls in (*get_physical_ruleset(), *self._custom_rule_classes):
++            if not isinstance(rule_cls, type) or not issubclass(rule_cls, Rule):
++                raise TypeError(
++                    "custom_physical_optimizer_rule_classes must contain "
++                    f"Rule subclasses, got {rule_cls!r}"
++                )
++            if rule_cls in seen:
++                continue
++            ruleset.add(rule_cls)
++            seen.add(rule_cls)
++        return [rule_cls() for rule_cls in ruleset]
++
++    def optimize(self, plan: PhysicalPlan) -> PhysicalPlan:
++        """Optimize using the stock rules plus this plan's context-local rules."""
++
++        self._custom_rule_classes = tuple(
++            plan.context.custom_physical_optimizer_rule_classes
++        )
++        return super().optimize(plan)
+ 
+ 
+ def get_execution_plan(
+diff --git a/python/ray/data/context.py b/python/ray/data/context.py
+index f600a36da5..ab46b4e996 100644
+--- a/python/ray/data/context.py
++++ b/python/ray/data/context.py
+@@ -21,6 +21,7 @@ if TYPE_CHECKING:
+     from ray.data._internal.issue_detection.issue_detector_configuration import (
+         IssueDetectorsConfiguration,
+     )
++    from ray.data._internal.logical.interfaces import Rule
+     from ray.data._internal.tensor_extensions.arrow import FixedShapeTensorFormat
+ 
+ logger = logging.getLogger(__name__)
+@@ -896,6 +897,13 @@ class DataContext:
+         default_factory=list
+     )
+ 
++    # Physical optimizer extensions attached to plans created with this context.
++    # Keeping these classes on DataContext avoids process-global rule registration
++    # and propagates the extension to remote Dataset planners.
++    custom_physical_optimizer_rule_classes: List[Type["Rule"]] = field(
++        default_factory=list
++    )
++
+     default_map_logical_memory_enabled: bool = (
+         DEFAULT_DEFAULT_MAP_LOGICAL_MEMORY_ENABLED
+     )
+-- 
+2.34.1
+

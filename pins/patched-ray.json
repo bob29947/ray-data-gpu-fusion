@@ -1,0 +1,29 @@
+{
+  "base_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+  "base_version": "3.0.0.dev0",
+  "patch_series_sha256": "65dca25287125c640b93402ec2fe1c9562370654602b3452bdf874c1573bc84f",
+  "patches": [
+    {
+      "file": "0001-ray-data-support-plan-local-physical-optimizer-rules.patch",
+      "sha256": "1c083b73024947190c38e9b0b209b0d8e0b7c6c6358f72de254883b41f456c35"
+    },
+    {
+      "file": "0002-ray-data-expose-backend-neutral-parquet-scan-descrip.patch",
+      "sha256": "b392bbf4b1762c10ba153e643df7e20302083a65b799c0fc35cb85ba17d1010b"
+    },
+    {
+      "file": "0003-ray-data-add-demand-driven-actor-pool-lifecycle.patch",
+      "sha256": "2b5a22a967511b08ff85c46d5f0802253a8b869c720466b87dae30da3c3f21c8"
+    }
+  ],
+  "production_delta": {
+    "files": 5,
+    "insertions": 357,
+    "deletions": 9,
+    "net_lines": 348
+  },
+  "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
+  "wheel_sha256": "44fbfe7202da9fa50a71caedc12f91270ba234bcbc9bcd4880d9338a4a0b4638",
+  "wheel_size_bytes": 40323332,
+  "build": "scripts/build_patched_ray_wheel.py"
+}

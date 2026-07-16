@@ -1,0 +1,145 @@
+# Architecture
+
+`ray-data-gpu-fusion` is an optimizer and execution-backend extension for Ray
+Data. It is not a Dataset interpreter and it does not run a scheduler beside
+Ray.
+
+## Where it hooks into Ray
+
+```text
+ordinary Ray Dataset API
+        |
+        v
+Ray logical optimization and physical planning
+        |
+        v
+plan-local rules installed by rgf.enable()
+  1. lower eligible physical nodes to closed GPU candidates
+  2. fuse compatible linear candidates opportunistically
+        |
+        v
+Ray StreamingExecutor
+        |
+        v
+Ray Core actor scheduling, ObjectRefs, resources, retries, metrics, shutdown
+```
+
+Calling `rgf.enable()` adds two importable rule classes to the current
+`DataContext`. A Dataset captures that context when it is built. When a normal
+action such as `materialize()`, `count()`, or `iter_batches()` asks Ray for an
+execution plan, Ray invokes the rules as part of its own physical optimizer.
+The resulting operators are ordinary Ray physical operators and are consumed
+by the stock `StreamingExecutor`.
+
+There is no plugin-owned action wrapper, graph runner, queue, resource manager,
+or actor scheduler.
+
+## Closed nodes before fusion
+
+Lowering first makes every accepted node independently executable. Phase 0 has
+two forms:
+
+- A standalone eligible `MapBatches` is a Ray `ActorPoolMapOperator` using the
+  already-planned stock Ray transformer. Its candidate also carries a native
+  `TransformSpec` that can participate in fusion.
+- A standalone eligible Parquet read is a Ray `ActorPoolMapOperator` around a
+  closed plugin program: Ray-block work descriptors enter the actor, exact
+  row groups are read with cuDF, and Arrow blocks leave the actor.
+
+Turning fusion off with `rgf.enable(fusion=False)` therefore leaves a valid
+Ray plan. Fusion is an optimization, never the condition that makes a node
+runnable.
+
+## Fusion
+
+Each candidate declares:
+
+- input and output payload kinds;
+- a runtime transform key and immutable configuration;
+- execution requirements, including actor-pool shape and Ray resources;
+- required and provided data properties.
+
+The fusion rule only folds a linear edge when payloads, properties, retry
+semantics, actor lifecycle, resources, placement, runtime environment, and
+backend identity compose exactly. A refusal leaves both original executable
+nodes in the plan.
+
+For a compatible `read_parquet -> map_batches -> map_batches` chain, Ray sees
+one physical actor-pool operator. Inside one actor task the plugin runs:
+
+```text
+Ray work-descriptor block
+  -> Parquet work import
+  -> cuDF exact-row-group read
+  -> cuDF batch UDF
+  -> cuDF batch UDF
+  -> Arrow block export
+```
+
+The intermediate frames stay on the GPU only inside this fused region.
+
+## Two GPU regions that cannot fuse
+
+Phase 0 deliberately uses an Arrow-backed Ray ObjectRef boundary:
+
+```text
+GPU region A -> Arrow Ray blocks -> GPU region B
+```
+
+The regions have separate Ray actor pools. Both pools are demand-driven. The
+downstream pool reports zero minimum resources and does not request actors
+while an upstream demand-driven GPU region is still executing. Region A drains
+and releases pending and idle actors; then region B asks Ray Core for GPUs and
+starts as soon as any actor is ready. Ray, not the plugin, decides placement
+and arbitrates independent branches.
+
+This trades extra device/host conversion and Object Store pressure for a
+simple ownership boundary and deadlock-free Phase-0 resource behavior. An
+opaque device-resident boundary is reserved for a later phase.
+
+The Phase-0 handoff is deliberately whole-region: while region A drains,
+region B can accept its Arrow bundles but does not acquire GPU actors. This can
+buffer the complete output of region A in the Ray Object Store. In addition,
+each actor task materializes all of its Arrow output before its first yield so
+I/O, CUDA, and UDF failures are reported atomically through that task. Those
+two choices bound complexity, but make Object Store capacity and per-task host
+memory explicit benchmark dimensions for this prototype.
+
+## Fallback and failures
+
+- A recognition, compatibility, or materialization refusal during planning
+  keeps the original stock Ray physical node.
+- A fusion refusal keeps the independently executable GPU nodes.
+- Once execution begins, I/O, CUDA, actor, and user-code failures follow Ray's
+  normal retry and failure path. The plugin does not replay work on a second
+  implementation.
+
+`rgf.explain(dataset)` constructs the same optimized physical plan Ray would
+execute and includes the selected standalone/fused regions and stable planning
+refusal reasons.
+
+## Why the small Ray patch exists
+
+The pinned Ray checkout receives only three backend-neutral seams:
+
+1. plan-local physical optimizer rule classes on `DataContext`;
+2. a conservative Parquet external-scan descriptor that performs no I/O;
+3. optional demand-driven lifecycle controls on `ActorPoolMapOperator`.
+
+The patch contains no cuDF, CUDA, plugin, or GPU-fusion imports. Everything
+specific to recognition, composition, GPU execution, and future API adapters
+lives in the plugin distribution.
+
+## Adding future Ray Data APIs
+
+A new API adapter should do four things without changing the fusion engine:
+
+1. recognize one exact logical/physical shape and decline unsupported options;
+2. emit a native `TransformSpec` with payload and property contracts;
+3. register an actor-local runtime for that transform key;
+4. provide a standalone closed materialization path before enabling fusion.
+
+Scalar expressions, encoders, and preprocessors can therefore share the same
+composition and execution machinery. APIs that require exchanges, grouping,
+ordering, multiple inputs, or a new ownership boundary add explicit payloads
+and properties rather than special cases to the existing MapBatches adapter.
