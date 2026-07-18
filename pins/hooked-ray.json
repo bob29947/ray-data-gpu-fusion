@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "layer": "hooked-ray",
+  "base_manifest": "pins/pr-candidate.json",
+  "base_source_tree": "4a3491f6e85ebaffb53308067bd63fadfbffcc01",
+  "base_wheel_sha256": "371787e29e1c84e134e7c9354dbd63037b0c268cdd3869dda0cbf20b8c45ee6b",
+  "hooks": [
+    {
+      "id": "H1",
+      "file": "ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch",
+      "from_commit": "d3515e0d27c77e9e0a713a09974c5f88449bc3b5",
+      "sha256": "edabe51cc36d1a8569def4673e4a193831452fa2543307ab558892a70b29bc9a",
+      "changed_files": [
+        "python/ray/data/_internal/logical/optimizers.py",
+        "python/ray/data/context.py"
+      ],
+      "loc": {
+        "insertions": 32,
+        "deletions": 1
+      }
+    },
+    {
+      "id": "H2",
+      "file": "ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch",
+      "from_commit": "fa4d2842b2a21bc00bc91ae4f8eb29f094dc58a6",
+      "sha256": "21790c188591e459ce271baca4ef06246276c31c1a1941723cb095ef0abd60ad",
+      "changed_files": [
+        "python/ray/data/_internal/datasource/parquet_datasource.py"
+      ],
+      "loc": {
+        "insertions": 168,
+        "deletions": 0
+      }
+    }
+  ],
+  "hook_series_sha256": "9be51ab3dc0c2e5542478901695ab9575451c218b52bdaaba074b6db4dfaa84d",
+  "aggregate_series_sha256": "e296e79822c58c82e0a7e35ad29e591b12aeb3b893b79beb3678935cc763a4cf",
+  "changed_files": [
+    "python/ray/data/_internal/datasource/parquet_datasource.py",
+    "python/ray/data/_internal/logical/optimizers.py",
+    "python/ray/data/context.py"
+  ],
+  "loc": {
+    "insertions": 200,
+    "deletions": 1
+  },
+  "source_tree": "064a93a64fad03ce9e310db4b504086fb521c879",
+  "production_delta": {
+    "files": {
+      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "a6bb7580bbbaf353ef57300e45f05164f6e18090cf1b67b1b3b6a556bddf0606",
+      "ray/data/_internal/datasource/parquet_datasource.py": "0c9de1d56271736d46efbea52f6c34a0a0ec548a6bd4ff85d4d57f694459ebb0",
+      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "19e1cf5c85d7d1f9557160440fd4e52b80fd9fe8c8b71cf759868f8b2c3726fb",
+      "ray/data/_internal/execution/resource_manager.py": "5ab0186f6cf06edc4b4c8f138ff69439e1affcdbcb99b2ace9257fafd52f15fd",
+      "ray/data/_internal/execution/streaming_executor_state.py": "1d2a6f214612470d8e10bf1de0880e6b53d3cd8c64deb6c8e7130252fa486fd8",
+      "ray/data/_internal/logical/optimizers.py": "5a8aab0ff7365e4eeca5e8df719727ce57f105ead7092c1ebddd0a3979aad4f0",
+      "ray/data/context.py": "854636f24410d17491607774db4f446dcaf412aff3c03eacc9155b24d5932316"
+    },
+    "removed": []
+  },
+  "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
+  "wheel_sha256": "602b1137325b498e921a2fdac088a90e6eab44a865ab3dfabf42e85de53d4981",
+  "wheel_size_bytes": 40327054,
+  "build": "scripts/build_ray_wheels.py"
+}

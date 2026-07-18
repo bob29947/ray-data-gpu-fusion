@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Any, Iterable, Type
 
@@ -16,6 +15,7 @@ from ray.runtime_env import RuntimeEnv
 # the plugin imports aliases from here, making a future Ray-version shim local.
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
+from ray.data._internal.execution import resource_manager
 from ray.data._internal.execution.interfaces import (
     BlockEntry,
     PhysicalOperator,
@@ -45,9 +45,10 @@ from ray.data._internal.util import explain_plan as _ray_explain_plan
 from ray.data._internal.util import iterate_with_retry
 from ray.util.rpdb import _is_ray_debugger_post_mortem_enabled
 
-
 PINNED_RAY_COMMIT = "2741c6461d2bd3e5ff114af67be7a1190453dadd"
 PHYSICAL_RULE_CLASSES_ATTR = "custom_physical_optimizer_rule_classes"
+GPU_ACTOR_ADMISSION_CONTEXT_ATTR = "_enable_gpu_actor_admission_control"
+GPU_ACTOR_ADMISSION_CONTROL_VERSION = 1
 
 
 class RayCompatibilityError(RuntimeError):
@@ -63,28 +64,38 @@ class CompatibilityInfo:
     missing_seams: tuple[str, ...] = ()
 
 
-def compatibility() -> CompatibilityInfo:
+def compatibility(context: DataContext | None = None) -> CompatibilityInfo:
     """Return compatibility facts without raising or changing Ray state."""
 
     missing: list[str] = []
     commit = getattr(ray, "__commit__", None)
     if commit != PINNED_RAY_COMMIT:
         missing.append("pinned_ray_commit")
-    context = DataContext.get_current()
-    if not hasattr(context, PHYSICAL_RULE_CLASSES_ATTR):
+    selected = DataContext.get_current() if context is None else context
+    if not hasattr(selected, PHYSICAL_RULE_CLASSES_ATTR):
         missing.append("plan_local_physical_rules")
-    parameters = inspect.signature(ActorPoolMapOperator.__init__).parameters
-    for name in (
-        "defer_actor_start",
-        "wait_for_upstream_deferred_operators",
-        "release_idle_actors_on_completion",
+    if (
+        getattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION", None)
+        != GPU_ACTOR_ADMISSION_CONTROL_VERSION
     ):
-        if name not in parameters:
-            missing.append(name)
+        missing.append("gpu_actor_admission_control_v1")
+    if not callable(
+        getattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control", None)
+    ):
+        missing.append("gpu_actor_admission_candidate_hook")
+    if not hasattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR):
+        missing.append("gpu_actor_admission_context")
+    elif getattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is not True:
+        missing.append("gpu_actor_admission_disabled")
+    if getattr(selected, "op_resource_reservation_enabled", None) is not True:
+        missing.append("gpu_actor_admission_resource_reservation_disabled")
+    wait_for_min_actors_s = getattr(selected, "wait_for_min_actors_s", None)
+    if wait_for_min_actors_s is None or wait_for_min_actors_s > 0:
+        missing.append("gpu_actor_admission_blocking_actor_start")
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
         missing.append("parquet_external_scan_descriptor")
     return CompatibilityInfo(
-        adapter="ray-2741c646-phase0-v1",
+        adapter="ray-2741c646-phase0-admission-v1",
         ray_version=str(getattr(ray, "__version__", "unknown")),
         ray_commit=commit,
         supported=not missing,
@@ -92,7 +103,7 @@ def compatibility() -> CompatibilityInfo:
     )
 
 
-def verify_compatibility() -> None:
+def verify_compatibility(context: DataContext | None = None) -> None:
     """Fail before mutating a context when Ray or either patch is missing."""
 
     commit = getattr(ray, "__commit__", None)
@@ -102,24 +113,42 @@ def verify_compatibility() -> None:
             f"{PINNED_RAY_COMMIT}, but the installed Ray reports {commit!r}"
         )
 
-    context = DataContext.get_current()
-    if not hasattr(context, PHYSICAL_RULE_CLASSES_ATTR):
+    selected = DataContext.get_current() if context is None else context
+    if not hasattr(selected, PHYSICAL_RULE_CLASSES_ATTR):
         raise RayCompatibilityError(
             "Ray is at the pinned commit but lacks the plan-local physical-rule "
             "patch (DataContext.custom_physical_optimizer_rule_classes)"
         )
 
-    parameters = inspect.signature(ActorPoolMapOperator.__init__).parameters
-    required = {
-        "defer_actor_start",
-        "wait_for_upstream_deferred_operators",
-        "release_idle_actors_on_completion",
-    }
-    missing = required - parameters.keys()
-    if missing:
+    version = getattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION", None)
+    if version != GPU_ACTOR_ADMISSION_CONTROL_VERSION:
         raise RayCompatibilityError(
-            "Ray lacks the demand-driven actor-pool patch: "
-            f"missing {sorted(missing)!r}"
+            "Ray lacks generic GPU actor admission control version "
+            f"{GPU_ACTOR_ADMISSION_CONTROL_VERSION}; found {version!r}"
+        )
+    if not callable(
+        getattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control", None)
+    ):
+        raise RayCompatibilityError(
+            "Ray lacks ActorPoolMapOperator.uses_gpu_actor_admission_control()"
+        )
+
+    if not hasattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR):
+        raise RayCompatibilityError(
+            "Ray lacks DataContext._enable_gpu_actor_admission_control"
+        )
+    if getattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is not True:
+        raise RayCompatibilityError(
+            "DataContext._enable_gpu_actor_admission_control must be True"
+        )
+    if getattr(selected, "op_resource_reservation_enabled", None) is not True:
+        raise RayCompatibilityError(
+            "DataContext.op_resource_reservation_enabled must be True"
+        )
+    wait_for_min_actors_s = getattr(selected, "wait_for_min_actors_s", None)
+    if wait_for_min_actors_s is None or wait_for_min_actors_s > 0:
+        raise RayCompatibilityError(
+            "DataContext.wait_for_min_actors_s must be nonpositive"
         )
 
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
@@ -139,14 +168,6 @@ def get_rule_classes(context: DataContext) -> list[Type[Rule]]:
 
 def set_rule_classes(context: DataContext, classes: Iterable[Type[Rule]]) -> None:
     setattr(context, PHYSICAL_RULE_CLASSES_ATTR, list(classes))
-
-
-def demand_driven_actor_kwargs() -> dict[str, bool]:
-    return {
-        "defer_actor_start": True,
-        "wait_for_upstream_deferred_operators": True,
-        "release_idle_actors_on_completion": True,
-    }
 
 
 def stock_map_transformer(operator: PhysicalOperator) -> MapTransformer:
@@ -197,6 +218,8 @@ __all__ = [
     "CompatibilityInfo",
     "DataContext",
     "FuseOperators",
+    "GPU_ACTOR_ADMISSION_CONTEXT_ATTR",
+    "GPU_ACTOR_ADMISSION_CONTROL_VERSION",
     "InputDataBuffer",
     "LogicalOptimizer",
     "MapBatches",
@@ -217,7 +240,6 @@ __all__ = [
     "_is_ray_debugger_post_mortem_enabled",
     "create_planner",
     "compatibility",
-    "demand_driven_actor_kwargs",
     "explain_plan",
     "get_rule_classes",
     "iterate_with_retry",

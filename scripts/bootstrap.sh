@@ -4,6 +4,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python="$root/.venv/bin/python"
 stock_wheel="$root/wheels/stock/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl"
+candidate_wheel="$root/wheels/pr-candidate/$(basename "$stock_wheel")"
+hooked_wheel="$root/wheels/hooked/$(basename "$stock_wheel")"
 
 if [[ -n "${CONDA_EXE:-}" ]]; then
   conda_bin="$CONDA_EXE"
@@ -35,7 +37,9 @@ fi
 
 (
   cd "$root"
-  sha256sum --check pins/SHA256SUMS
+  # Outputs may be absent before a local rebuild. Existing pinned inputs must
+  # still match; the complete checksum set is checked after both layers exist.
+  sha256sum --check --ignore-missing pins/SHA256SUMS
 )
 
 "$python" -m pip install \
@@ -43,10 +47,13 @@ fi
   --require-hashes \
   -r "$root/environment/ray-runtime-linux-py311.lock"
 
-"$python" "$root/scripts/build_patched_ray_wheel.py"
-patched_wheel="$root/wheels/patched/$(basename "$stock_wheel")"
-if [[ ! -f "$patched_wheel" ]]; then
-  echo "Patched Ray wheel was not produced" >&2
+"$python" "$root/scripts/build_ray_wheels.py" --require-pins
+if [[ ! -f "$candidate_wheel" ]]; then
+  echo "PR-candidate Ray wheel was not produced: $candidate_wheel" >&2
+  exit 1
+fi
+if [[ ! -f "$hooked_wheel" ]]; then
+  echo "Hooked Ray wheel was not produced: $hooked_wheel" >&2
   exit 1
 fi
 (
@@ -54,6 +61,8 @@ fi
   sha256sum --check pins/SHA256SUMS
 )
 
-"$python" -m pip install --force-reinstall --no-deps "$patched_wheel"
+# C is retained as a separately inspectable artifact. Runtime installation is
+# always the complete stock+C+H1+H2 wheel, never the intermediate candidate.
+"$python" -m pip install --force-reinstall --no-deps "$hooked_wheel"
 "$python" -m pip install --no-deps --no-build-isolation --editable "$root/plugin"
 "$python" "$root/scripts/verify_install.py"

@@ -60,7 +60,7 @@ Each candidate declares:
 - required and provided data properties.
 
 The fusion rule only folds a linear edge when payloads, properties, retry
-semantics, actor lifecycle, resources, placement, runtime environment, and
+semantics, actor-pool shape, resources, placement, runtime environment, and
 backend identity compose exactly. A refusal leaves both original executable
 nodes in the plan.
 
@@ -86,24 +86,27 @@ Phase 0 deliberately uses an Arrow-backed Ray ObjectRef boundary:
 GPU region A -> Arrow Ray blocks -> GPU region B
 ```
 
-The regions have separate Ray actor pools. Both pools are demand-driven. The
-downstream pool reports zero minimum resources and does not request actors
-while an upstream demand-driven GPU region is still executing. Region A drains
-and releases pending and idle actors; then region B asks Ray Core for GPUs and
-starts as soon as any actor is ready. Ray, not the plugin, decides placement
-and arbitrates independent branches.
+The regions have separate Ray actor pools. The resource manager admits eligible
+static-resource GPU pools in topological order against
+the operator-reservation allocation. Every admitted pool receives at least a
+one-actor floor and may scale only within its allocation. The first pool whose
+floor does not fit is the frontier and may retain one queued actor request;
+later pools are blocked so they cannot leapfrog it. Dormant, completed, and
+blocked pools cancel pending actors and release idle actors, never active work.
+Ray Core still decides actor placement, and independent stages can stream
+concurrently whenever their floors fit.
 
 This trades extra device/host conversion and Object Store pressure for a
 simple ownership boundary and deadlock-free Phase-0 resource behavior. An
 opaque device-resident boundary is reserved for a later phase.
 
-The Phase-0 handoff is deliberately whole-region: while region A drains,
-region B can accept its Arrow bundles but does not acquire GPU actors. This can
-buffer the complete output of region A in the Ray Object Store. In addition,
-each actor task materializes all of its Arrow output before its first yield so
-I/O, CUDA, and UDF failures are reported atomically through that task. Those
-two choices bound complexity, but make Object Store capacity and per-task host
-memory explicit benchmark dimensions for this prototype.
+If both actor floors fit, the two regions may overlap and stream through the
+Arrow boundary. If the downstream floor does not fit, it waits at the frontier
+and queued Arrow bundles can increase Object Store pressure while upstream work
+drains. Each actor task also materializes all Arrow output before its first
+yield so I/O, CUDA, and UDF failures are reported atomically through that task.
+Object Store capacity and per-task host memory therefore remain explicit
+benchmark dimensions for this prototype.
 
 ## Fallback and failures
 
@@ -118,17 +121,27 @@ memory explicit benchmark dimensions for this prototype.
 execute and includes the selected standalone/fused regions and stable planning
 refusal reasons.
 
-## Why the small Ray patch exists
+## Ray candidate and local hooks
 
-The pinned Ray checkout receives only three backend-neutral seams:
+The pinned stock checkout is immutable. Derived Ray is split into two auditable
+layers:
 
-1. plan-local physical optimizer rule classes on `DataContext`;
-2. a conservative Parquet external-scan descriptor that performs no I/O;
-3. optional demand-driven lifecycle controls on `ActorPoolMapOperator`.
+1. C is the standalone PR candidate for generic, resource-aware GPU actor
+   admission control. It exposes capability version 1 and an internal
+   `DataContext` rollback field. It applies to GPU actor pools with statically
+   declared per-actor resources when operator reservation is enabled,
+   `wait_for_min_actors_s <= 0`, and no user-supplied dynamic
+   `ray_remote_args_fn` is configured; it contains no plugin dependency.
+2. H1 adds plan-local physical optimizer rule classes on `DataContext`.
+3. H2 adds a conservative Parquet external-scan descriptor that performs no
+   I/O.
 
-The patch contains no cuDF, CUDA, plugin, or GPU-fusion imports. Everything
-specific to recognition, composition, GPU execution, and future API adapters
-lives in the plugin distribution.
+C is built independently as `wheels/pr-candidate`. H1/H2 are then applied to C
+to build `wheels/hooked`, the only Ray wheel installed by bootstrap. The build
+also derives stock+C+H1+H2 directly and requires byte-for-byte equality with the
+layered hooked wheel. None of the three changes contains cuDF, CUDA, plugin, or
+GPU-fusion imports. Everything specific to recognition, composition, GPU
+execution, and future API adapters lives in the plugin distribution.
 
 ## Adding future Ray Data APIs
 

@@ -12,7 +12,6 @@ from ray_data_gpu_fusion._compat import (
     verify_compatibility,
 )
 
-
 CONFIG_KEY = "ray_data_gpu_fusion.phase0"
 
 
@@ -43,8 +42,8 @@ def enable(
     process-global optimizer registry is modified.
     """
 
-    verify_compatibility()
     selected = _context(context)
+    verify_compatibility(selected)
 
     from ray_data_gpu_fusion.rules import (
         FuseClosedGPUOperators,

@@ -24,7 +24,6 @@ from ray_data_gpu_fusion._compat import (
 )
 from ray_data_gpu_fusion.runtime import CudfRuntimeContext, FrameStream
 
-
 READ_PARQUET = "read_parquet"
 
 
@@ -80,7 +79,7 @@ def _reject(reason: str) -> ScanRecognition:
 
 
 def recognize_scan(logical_op: Any) -> ScanRecognition:
-    """Recognize only the stable external descriptor exposed by patched Ray."""
+    """Recognize only the stable external descriptor exposed by hooked Ray."""
 
     if type(logical_op) is not Read:
         return _reject("logical_read")

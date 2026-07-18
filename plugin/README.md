@@ -1,7 +1,7 @@
 # ray-data-gpu-fusion
 
 An opt-in Ray Data physical-optimizer and actor backend for modular cuDF
-operators. Install it beside the repository's pinned derived Ray wheel, then
+operators. Install it beside the repository's pinned final hooked Ray wheel, then
 enable it before constructing a Dataset:
 
 ```python

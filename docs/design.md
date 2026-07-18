@@ -62,8 +62,8 @@ or explicitly decline the replacement.
 Consider two GPU regions that cannot fuse. If both eagerly create actor pools
 whose configured size equals the cluster GPU count, the upstream pool can hold
 all GPUs while the downstream pool waits, or both pools can partially reserve
-resources without either making useful progress. Resource ownership must be
-demand-driven and coordinated through Ray's scheduler.
+resources without either making useful progress. Resource admission must be
+coordinated by Ray's allocator and scheduler.
 
 ### 1.4 CPU and GPU operations require explicit data boundaries
 
@@ -146,8 +146,8 @@ store, or resource manager.
 
 The proposal has three parts:
 
-1. **Ray extension contract.** Ray exposes plan-local physical rules, a neutral
-   Parquet scan descriptor, and demand-driven actor-pool lifecycle controls.
+1. **Ray extension contract.** Ray exposes generic resource-aware GPU actor
+   admission, plan-local physical rules, and a neutral Parquet scan descriptor.
 2. **External backend plugin.** The plugin recognizes Ray operations, creates
    closed GPU candidates, composes compatible candidates, and supplies
    actor-local cuDF runtimes.
@@ -164,7 +164,7 @@ runtime registry, cuDF MapBatches execution, exact-row-group Parquet planner,
 actor backend, and fusion algorithm moved into the plugin.
 
 The integration boundary was rewritten: Ray-specific GPU planner changes were
-replaced with the three generic extension seams described below. Grouped
+replaced with the generic candidate and two local hooks described below. Grouped
 partitions, range planning, and shuffle support were intentionally not extracted
 for Phase 0. The dirty-tree source used for the extraction is recorded in
 [`source-snapshot.json`](../pins/source-snapshot.json).
@@ -216,18 +216,17 @@ mechanisms; the plugin supplies policy and GPU implementation.
 
 ## 5. Ray extension contract
 
-The prototype adds 357 lines and removes 9 lines across five Ray production
-files. These changes contain no cuDF, CUDA, or plugin imports.
+The prototype keeps generic admission separate from the two plugin-extension
+hooks. None contains cuDF, CUDA, fusion logic, or plugin imports.
 
-| Extension | Ray files | Production change |
+| Layer | Capability | Provenance |
 | --- | --- | --- |
-| Plan-local physical rules | `ray/data/context.py`, `ray/data/_internal/logical/optimizers.py` | 32 insertions, 1 deletion |
-| External Parquet scan descriptor | `ray/data/_internal/datasource/parquet_datasource.py` | 168 insertions |
-| Demand-driven actors | `ray/data/_internal/execution/operators/actor_pool_map_operator.py`, `ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py` | 157 insertions, 8 deletions |
+| C | Resource-aware admission for eligible GPU actor pools with statically declared resources | `pins/pr-candidate.json` records the exact local commit, changed files, LOC, tree, patch, and wheel hashes |
+| H1 | Plan-local physical optimizer rules | First and only first hook in `ray-hooks/` |
+| H2 | Backend-neutral Parquet scan descriptor | Second and only second hook in `ray-hooks/` |
 
-The snippets below are taken from the prototype patch series. Unrelated
-unchanged code and some validation branches are omitted; the complete diffs are
-linked in each subsection.
+The snippets below omit unrelated unchanged code and some validation branches;
+the complete C/H1/H2 diffs are linked in each subsection.
 
 ### 5.1 Plan-local physical optimizer rules
 
@@ -248,7 +247,7 @@ plan rather than a global plugin registry.
 
 - `python/ray/data/context.py`
 - `python/ray/data/_internal/logical/optimizers.py`
-- Full diff: [`0001-ray-data-support-plan-local-physical-optimizer-rules.patch`](../ray-patches/0001-ray-data-support-plan-local-physical-optimizer-rules.patch)
+- Full diff: [`0001-ray-data-support-plan-local-physical-optimizer-rules.patch`](../ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch)
 
 #### Ray code
 
@@ -353,7 +352,7 @@ GPU-specific type.
 #### Where it lives
 
 - `python/ray/data/_internal/datasource/parquet_datasource.py`
-- Full diff: [`0002-ray-data-expose-backend-neutral-parquet-scan-descrip.patch`](../ray-patches/0002-ray-data-expose-backend-neutral-parquet-scan-descrip.patch)
+- Full diff: [`0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch`](../ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch)
 
 #### Ray code
 
@@ -490,148 +489,61 @@ The plugin then reads footers, verifies source identity, plans exact row-group
 work, and selects cuDF/KvikIO runtime behavior. None of that GPU implementation
 is added to Ray.
 
-### 5.3 Demand-driven actor-pool lifecycle
+### 5.3 Resource-aware GPU actor admission
 
 #### Why this change is needed
 
-Ray's actor-pool map operator normally requests its initial actors when the
-operator starts. That is appropriate for a single actor stage, but it can be a
-problem for sequential GPU regions. If region A and region B each configure a
-pool that can use every GPU, both pools may request scarce GPUs before either
-has runnable work. A plugin cannot fix this only in its UDF: actor requests,
-minimum-resource reporting, autoscaling, and idle-actor release happen inside
-Ray's physical operator and autoscaler.
+Several GPU actor pools can become runnable in one physical DAG. If
+each requests its configured minimum without regard to the operator resource
+allocator, later pools can hold scarce GPUs while an earlier pool cannot acquire
+enough capacity to make progress. A plugin cannot safely coordinate this from
+inside its UDF because actor requests, allocations, scaling, and idle release
+belong to Ray.
 
-The lifecycle change is backend-neutral. Any expensive actor stage can defer
-resource acquisition until input exists and can wait for an upstream deferred
-stage to release a shared resource.
+C adds generic admission control to Ray's resource manager. It applies only to
+GPU `ActorPoolMapOperator` instances with statically declared per-actor
+resources, operator reservation enabled, `wait_for_min_actors_s <= 0`, and no
+user-supplied dynamic `ray_remote_args_fn`.
+Unsupported or disabled cases retain the stock lifecycle.
 
 #### Where it lives
 
-- `python/ray/data/_internal/execution/operators/actor_pool_map_operator.py`
-- `python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py`
-- Full diff: [`0003-ray-data-add-demand-driven-actor-pool-lifecycle.patch`](../ray-patches/0003-ray-data-add-demand-driven-actor-pool-lifecycle.patch)
+- Ray resource-manager and actor-pool internals changed by C
+- Full diff: [`0001-ray-data-resource-aware-gpu-actor-admission.patch`](../ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch)
 
 #### Ray code
 
-The controls are optional constructor arguments, so existing operators retain
-their original eager behavior:
+The candidate exposes a narrow internal capability contract:
 
 ```python
-def __init__(
-    self,
-    # Existing ActorPoolMapOperator arguments...
-    defer_actor_start: bool = False,
-    wait_for_upstream_deferred_operators: bool = False,
-    release_idle_actors_on_completion: bool = False,
-):
+GPU_ACTOR_ADMISSION_CONTROL_VERSION = 1
+
+# Internal, environment-backed rollback field on DataContext; defaults true.
+_enable_gpu_actor_admission_control: bool
 ```
 
-An already-planned stock actor map can also be configured before execution:
+For each demanded or active eligible pool, Ray calculates a one-actor
+CPU/GPU/memory floor. Claimants are scanned in topological order:
 
-```python
-def configure_demand_driven_start(
-    self,
-    *,
-    wait_for_upstream_deferred_operators: bool = True,
-    release_idle_actors_on_completion: bool = True,
-) -> None:
-    if self._started:
-        raise RuntimeError(
-            "demand-driven actor startup must be configured before start()"
-        )
-    self._defer_actor_start = True
-    self._wait_for_upstream_deferred_operators = bool(
-        wait_for_upstream_deferred_operators
-    )
-    self._release_idle_actors_on_completion = bool(
-        release_idle_actors_on_completion
-    )
-```
+1. every floor that fits is admitted and receives an allocator allocation;
+2. an admitted pool starts on demand and may scale only within that allocation;
+3. the first floor that does not fit becomes the frontier and may retain one
+   queued actor request; and
+4. later claimants are blocked, preventing them from leapfrogging the frontier.
 
-The pool starts only after input demand and, optionally, after upstream deferred
-regions have completed:
-
-```python
-def _ensure_actor_pool_started(self) -> bool:
-    if self._actors_requested:
-        return True
-    if (
-        self._wait_for_upstream_deferred_operators
-        and not self._upstream_deferred_operators_finished()
-    ):
-        return False
-    if self._actor_cls is None:
-        raise RuntimeError("actor pool cannot start before operator.start()")
-
-    self._actors_requested = True
-    self._actor_pool.scale(
-        ActorPoolScalingRequest(
-            delta=self._actor_pool.initial_size(),
-            reason="input demand" if self._defer_actor_start else "initial size",
-        )
-    )
-    return True
-
-
-def _upstream_deferred_operators_finished(self) -> bool:
-    visited = set()
-    stack = list(self.input_dependencies)
-    while stack:
-        operator = stack.pop()
-        if operator in visited:
-            continue
-        visited.add(operator)
-        if (
-            getattr(operator, "defer_actor_start", False)
-            and not operator.has_execution_finished()
-        ):
-            return False
-        stack.extend(operator.input_dependencies)
-    return True
-```
-
-Before activation, the operator must not tell Ray that its configured minimum
-actors are already required:
-
-```python
-def min_scheduling_resources(self) -> ExecutionResources:
-    if self._defer_actor_start and not self._actors_requested:
-        return ExecutionResources.zero()
-    return self._actor_pool.per_actor_resource_usage()
-```
-
-The actor autoscaler also respects this intentional below-minimum state:
-
-```python
-# python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
-
-if getattr(op, "actor_pool_start_deferred", False):
-    return ActorPoolScalingRequest.no_op(reason="waiting for input demand")
-```
-
-Without the autoscaler guard, Ray would immediately restore the actor pool to
-its configured minimum and defeat deferred startup.
+Completed, dormant, and blocked pools cancel pending actors and release idle
+actors, but never active work. This lets a frontier request acquire capacity as
+soon as it is available. When enough GPUs exist, multiple admitted stages keep
+streaming concurrently instead of being serialized unnecessarily.
 
 #### How the plugin uses it
 
-All plugin actor regions pass the generic lifecycle options:
-
-```python
-# ray_data_gpu_fusion/_compat.py
-
-def demand_driven_actor_kwargs() -> dict[str, bool]:
-    return {
-        "defer_actor_start": True,
-        "wait_for_upstream_deferred_operators": True,
-        "release_idle_actors_on_completion": True,
-    }
-```
-
-The plugin also calls `configure_demand_driven_start()` on an unsupported stock
-GPU `ActorPoolMapOperator` when it follows a plugin GPU ancestor. This prevents
-a stock downstream GPU map from eagerly reserving resources and reintroducing
-the same handoff problem.
+The plugin creates ordinary GPU actor pools with statically declared per-actor
+resources. Fixed and autoscaling pool sizes are both eligible. The plugin
+checks capability version 1 during compatibility validation, but does not pass
+private lifecycle arguments, mutate stock operators, or implement a second
+admission policy. Ray selects all eligible pools across the complete physical
+DAG, including stock and plugin-created pools.
 
 ### 5.4 Why these changes belong in Ray
 
@@ -639,8 +551,8 @@ The extension boundary is intentionally narrow:
 
 - optimizer invocation must be in Ray because Ray owns the physical plan;
 - scan description must be in Ray because Ray owns datasource semantics; and
-- actor lifecycle must be in Ray because Ray owns scheduling-resource reports,
-  actor pools, and autoscaling.
+- actor admission must be in Ray because Ray owns resource allocation, actor
+  pools, and autoscaling.
 
 Everything that answers a GPU-specific question remains in the plugin:
 
@@ -840,9 +752,9 @@ GPU Parquet read
 ```
 
 The CPU operator is a fusion barrier. The GPU read and GPU map are separate
-demand-driven actor regions. The downstream GPU pool can queue Arrow input but
-does not request GPUs until the upstream GPU pool has finished and released
-them.
+actor regions governed by Ray's generic admission policy. If both one-actor
+floors fit, they may stream concurrently. Otherwise the downstream region waits
+at or behind the frontier without leapfrogging the earlier claimant.
 
 ### 8.4 Two incompatible GPU regions
 
@@ -915,25 +827,20 @@ Read-to-map fusion does not cross this boundary.
 A later GPU-native split transform may slice actor-local cuDF frames and allow
 fusion to continue, but that optimization is not required for correctness.
 
-## 10. Resource lifecycle
+## 10. Resource admission and lifecycle
 
 All plugin physical regions use Ray actor pools. The plugin translates an
 execution profile into ordinary Ray remote arguments, including CPUs, one GPU
 per actor, memory, custom resources, placement, runtime environment, actor
 restart policy, and task retry policy.
 
-Demand-driven pools follow this lifecycle:
-
-1. the physical operator starts without immediately reserving its configured
-   actor minimum;
-2. the first input bundle creates demand;
-3. if an upstream demand-driven region is unfinished, the bundle remains queued;
-4. after upstream completion, the operator requests its initial actors;
-5. work dispatches as soon as the first actor becomes ready; and
-6. actors are released after input and queued work are complete.
-
-This mechanism coordinates sequential regions. Independent branches are still
-arbitrated by Ray Core according to normal resource availability.
+For an eligible static GPU pool, Ray admission reserves a one-actor floor when
+the pool is demanded or active and bounds later scaling by the allocator's
+allocation. Topological admitted/frontier/blocked states prevent later pools
+from capturing capacity needed by the frontier. Pools that become dormant,
+complete, or blocked cancel pending requests and release idle actors; active
+tasks continue normally. Independent stages whose floors fit may run and stream
+concurrently, while Ray Core retains placement authority.
 
 ## 11. Boundaries and memory behavior
 
@@ -986,15 +893,16 @@ reasons.
 The prototype repository contains:
 
 - a clean pinned Ray submodule;
-- three backend-neutral patch files;
-- stock and derived Ray wheels;
+- one generic PR-candidate patch C;
+- exactly two local backend-neutral hooks H1/H2;
+- independently pinned stock, PR-candidate, and hooked Ray wheels;
 - the external plugin distribution; and
 - a pinned RAPIDS environment.
 
 This layout proves the extension contract without making the dirty GPU fork the
 runtime dependency.
 
-If Ray accepts the three generic seams, normal deployment becomes:
+If Ray accepts C and the two hooks, normal deployment becomes:
 
 ```text
 official Ray wheel with extension APIs
@@ -1002,20 +910,23 @@ official Ray wheel with extension APIs
 + ray-data-gpu-fusion on driver and workers
 ```
 
-The derived Ray wheel, source submodule, and patch application step then leave
-the installation path. They may remain as prototype provenance.
+The prototype build preserves `stock`, `stock+C`, and `stock+C+H1+H2` as
+separate artifacts. Bootstrap installs only the last layer and proves it equals
+a direct stock+C+H1+H2 build. Once those capabilities ship in an official Ray
+wheel, the derived wheels and patch application step leave the installation
+path and may remain only as provenance.
 
 An official Ray release will have a different version and commit. The plugin
 must publish a corresponding tested compatibility adapter; the current
 prototype intentionally does not accept an arbitrary later Ray commit merely
 because similarly named methods are present.
 
-The three capabilities should eventually be feature-gated independently:
+The three capabilities are independently identifiable:
 
+- resource-aware GPU actor admission is the generic candidate C and has an
+  internal rollback field;
 - physical-rule injection is required for any optimizer plugin;
-- the external scan descriptor is required only for direct Parquet GPU reads;
-- demand-driven actor lifecycle is required for the current GPU actor backend
-  and safe scarce-GPU handoff.
+- the external scan descriptor is required only for direct Parquet GPU reads.
 
 ## 14. Extending to additional Ray Data APIs
 
@@ -1050,7 +961,7 @@ Implemented fast paths:
 - standalone closed GPU reads and maps;
 - compatible linear fusion;
 - Arrow boundaries between incompatible regions; and
-- demand-driven handoff between GPU pools.
+- resource-aware admission across eligible GPU pools.
 
 Intentionally deferred:
 
@@ -1069,7 +980,7 @@ The exact implemented eligibility matrix is maintained separately in
 The implementation is validated at four levels:
 
 1. **Ray extension contracts:** plan-local rule isolation, datasource descriptor
-   behavior, demand-driven actor lifecycle, and scarce-resource handoff.
+   behavior, generic actor admission, fairness, and scarce-resource handoff.
 2. **Plugin unit contracts:** eligibility, composition, empty-batch parity,
    generator behavior, lowering, fusion, and refusal diagnostics.
 3. **Ray integration:** unsupported operations execute on the unchanged stock

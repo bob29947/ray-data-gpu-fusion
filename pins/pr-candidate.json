@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "layer": "pr-candidate",
+  "base_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+  "base_version": "3.0.0.dev0",
+  "stock_wheel_sha256": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
+  "local_commit": "ede9354c70e7e27afb5105abf3b406c6c9a4be31",
+  "patch": {
+    "file": "ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch",
+    "from_commit": "ede9354c70e7e27afb5105abf3b406c6c9a4be31",
+    "sha256": "d4b2400584b929a4d5b0712ab2886326c5eab72056f876b9f47a213f8ad9dc5f"
+  },
+  "patch_series_sha256": "896e20273cba157a645f3ecfe976be7f85b12d3739c9c134810f918cde09b113",
+  "source_tree": "4a3491f6e85ebaffb53308067bd63fadfbffcc01",
+  "changed_files": [
+    "doc/source/data/release-notes/gpu-actor-admission-control.md",
+    "python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py",
+    "python/ray/data/_internal/execution/operators/actor_pool_map_operator.py",
+    "python/ray/data/_internal/execution/resource_manager.py",
+    "python/ray/data/_internal/execution/streaming_executor_state.py",
+    "python/ray/data/context.py",
+    "python/ray/data/tests/test_actor_pool_map_operator.py",
+    "python/ray/data/tests/test_autoscaler.py",
+    "python/ray/data/tests/test_map_operator.py",
+    "python/ray/data/tests/test_reservation_based_resource_allocator.py",
+    "python/ray/data/tests/test_resource_manager.py",
+    "python/ray/data/tests/test_streaming_executor.py"
+  ],
+  "loc": {
+    "insertions": 1709,
+    "deletions": 33
+  },
+  "production_delta": {
+    "files": {
+      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "a6bb7580bbbaf353ef57300e45f05164f6e18090cf1b67b1b3b6a556bddf0606",
+      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "19e1cf5c85d7d1f9557160440fd4e52b80fd9fe8c8b71cf759868f8b2c3726fb",
+      "ray/data/_internal/execution/resource_manager.py": "5ab0186f6cf06edc4b4c8f138ff69439e1affcdbcb99b2ace9257fafd52f15fd",
+      "ray/data/_internal/execution/streaming_executor_state.py": "1d2a6f214612470d8e10bf1de0880e6b53d3cd8c64deb6c8e7130252fa486fd8",
+      "ray/data/context.py": "3898f91e4830935a56401ae431de71bcb98252f4a670e89bba8a1048c4e3bd00"
+    },
+    "removed": []
+  },
+  "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
+  "wheel_sha256": "371787e29e1c84e134e7c9354dbd63037b0c268cdd3869dda0cbf20b8c45ee6b",
+  "wheel_size_bytes": 40325135,
+  "build": "scripts/build_ray_wheels.py"
+}

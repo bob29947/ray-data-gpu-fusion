@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.fs as pafs
@@ -9,24 +8,39 @@ import pyarrow.parquet as pq
 import pytest
 
 import ray
-from ray.data._internal.actor_autoscaler.default_actor_autoscaler import (
-    DefaultActorAutoscaler,
-)
+import ray.data
+import ray_data_gpu_fusion as rgf
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
-from ray.data._internal.execution.interfaces import ExecutionResources
+from ray.data._internal.execution import resource_manager
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
-from ray.data._internal.execution.operators.map_transformer import (
-    BlockMapTransformFn,
-    MapTransformer,
-)
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
 from ray.data._internal.logical.optimizers import PhysicalOptimizer
 from ray.data._internal.logical.operators import Read
-from ray.data.block import Block
 from ray.data.context import DataContext
+from ray_data_gpu_fusion._compat import (
+    GPU_ACTOR_ADMISSION_CONTEXT_ATTR,
+    GPU_ACTOR_ADMISSION_CONTROL_VERSION,
+    ParquetDatasource,
+    RayCompatibilityError,
+    compatibility,
+    optimized_physical_plan,
+)
+from ray_data_gpu_fusion.config import CONFIG_KEY
+from ray_data_gpu_fusion.operators import (
+    CreationOptions,
+    ExecutableGPUMapBatchesOperator,
+)
+from ray_data_gpu_fusion.rules import Eligibility
+from ray_data_gpu_fusion.specs import (
+    FRAME_STREAM,
+    ExecutionProfile,
+    ExecutionRequirements,
+    OperatorSpec,
+    TransformSpec,
+)
 
 
 class _RecordRule(Rule):
@@ -38,70 +52,102 @@ class _RecordRule(Rule):
         return plan
 
 
-class _ConfigureDemandDrivenActors(Rule):
-    def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
-        for operator in plan.dag.post_order_iter():
-            if isinstance(operator, ActorPoolMapOperator):
-                operator.configure_demand_driven_start(
-                    wait_for_upstream_deferred_operators=False,
-                    release_idle_actors_on_completion=True,
-                )
-        plan.context.custom_physical_optimizer_rule_classes = [
-            rule
-            for rule in plan.context.custom_physical_optimizer_rule_classes
-            if rule is not type(self)
-        ]
-        return plan
+class _ContextWithoutAdmissionFlag:
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        if name == GPU_ACTOR_ADMISSION_CONTEXT_ATTR:
+            raise AttributeError(name)
+        return getattr(self._delegate, name)
 
 
-class _ConfigureSequentialDemandDrivenActors(Rule):
-    def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
-        actor_operators = [
-            operator
-            for operator in plan.dag.post_order_iter()
-            if isinstance(operator, ActorPoolMapOperator)
-        ]
-        for operator in actor_operators:
-            operator.configure_demand_driven_start(
-                wait_for_upstream_deferred_operators=True,
-                release_idle_actors_on_completion=True,
-            )
-        plan.context.set_config(
-            "phase0.test.sequential_actor_regions", len(actor_operators)
-        )
-        plan.context.custom_physical_optimizer_rule_classes = [
-            rule
-            for rule in plan.context.custom_physical_optimizer_rule_classes
-            if rule is not type(self)
-        ]
-        return plan
-
-
-def _identity_transformer() -> MapTransformer:
-    def identity(blocks: Iterable[Block], _):
-        yield from blocks
-
-    return MapTransformer([BlockMapTransformFn(identity, disable_block_shaping=True)])
-
-
-def _actor_op(
-    context: DataContext,
-    input_op,
-    *,
-    defer_actor_start: bool = False,
-    wait_for_upstream_deferred_operators: bool = False,
-    release_idle_actors_on_completion: bool = False,
-) -> ActorPoolMapOperator:
-    return ActorPoolMapOperator(
-        _identity_transformer(),
-        input_op,
-        context,
-        ActorPoolStrategy(size=2),
-        ray_remote_args={"num_cpus": 0, "num_gpus": 1},
-        defer_actor_start=defer_actor_start,
-        wait_for_upstream_deferred_operators=(wait_for_upstream_deferred_operators),
-        release_idle_actors_on_completion=release_idle_actors_on_completion,
+def _plugin_eligibility(logical_op, context: DataContext) -> Eligibility:
+    spec = OperatorSpec(
+        (TransformSpec("test_plugin_map", FRAME_STREAM, FRAME_STREAM),),
+        ExecutionRequirements(profile=ExecutionProfile(num_cpus=0)),
     )
+    return Eligibility(
+        True,
+        spec=spec,
+        creation_options=CreationOptions(
+            name=f"GPU[{logical_op.name}]",
+            min_rows_per_bundle=logical_op.min_rows_per_bundled_input,
+            target_max_block_size_override=context.target_max_block_size,
+        ),
+    )
+
+
+def _reachable(root) -> tuple[object, ...]:
+    visited = set()
+    result = []
+    stack = [root]
+    while stack:
+        operator = stack.pop()
+        if operator in visited:
+            continue
+        visited.add(operator)
+        result.append(operator)
+        stack.extend(operator.input_dependencies)
+    return tuple(result)
+
+
+@pytest.fixture
+def one_gpu_context():
+    started_here = not ray.is_initialized()
+    if started_here:
+        ray.init(num_cpus=2, num_gpus=1, include_dashboard=False)
+    if float(ray.cluster_resources().get("GPU", 0)) < 1:
+        pytest.skip("requires a Ray cluster advertising one logical GPU")
+
+    context = DataContext.get_current()
+    previous_rules = list(context.custom_physical_optimizer_rule_classes)
+    previous_admission = getattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR)
+    previous_reservation = context.op_resource_reservation_enabled
+    previous_wait = context.wait_for_min_actors_s
+    setattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR, True)
+    context.op_resource_reservation_enabled = True
+    context.wait_for_min_actors_s = -1
+    try:
+        yield context
+    finally:
+        context.custom_physical_optimizer_rule_classes = previous_rules
+        setattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR, previous_admission)
+        context.op_resource_reservation_enabled = previous_reservation
+        context.wait_for_min_actors_s = previous_wait
+        context.remove_config(CONFIG_KEY)
+        if started_here:
+            ray.shutdown()
+
+
+def test_required_hooks_and_generic_gpu_admission_capability_are_available():
+    context = DataContext.get_current().copy()
+
+    info = compatibility(context)
+
+    assert info.supported
+    assert info.missing_seams == ()
+    assert (
+        resource_manager.GPU_ACTOR_ADMISSION_CONTROL_VERSION
+        == GPU_ACTOR_ADMISSION_CONTROL_VERSION
+    )
+    assert getattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is True
+
+
+def test_plugin_source_does_not_reference_the_legacy_actor_lifecycle_seam():
+    source_root = Path(__file__).parents[2] / "src"
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(source_root.rglob("*.py"))
+    )
+
+    for symbol in (
+        "demand_driven_actor_kwargs",
+        "defer_actor_start",
+        "wait_for_upstream_deferred_operators",
+        "release_idle_actors_on_completion",
+        "configure_demand_driven_start",
+    ):
+        assert symbol not in source
 
 
 def test_physical_optimizer_rules_are_plan_local_and_deduplicated():
@@ -161,155 +207,335 @@ def test_default_public_parquet_read_has_external_scan_descriptor(tmp_path):
             ray.shutdown()
 
 
-def test_demand_driven_actor_lifecycle_is_generic_and_zero_before_activation():
+@pytest.mark.parametrize(
+    ("missing", "expected_seam"),
+    (
+        ("candidate", "gpu_actor_admission_control_v1"),
+        ("candidate_hook", "gpu_actor_admission_candidate_hook"),
+        ("context", "gpu_actor_admission_context"),
+        ("h1", "plan_local_physical_rules"),
+        ("h2", "parquet_external_scan_descriptor"),
+    ),
+)
+def test_enable_fails_closed_when_a_required_capability_is_missing(
+    monkeypatch, missing, expected_seam
+):
     context = DataContext.get_current().copy()
-    source = InputDataBuffer(context, input_data=[])
-    upstream = _actor_op(
-        context,
-        source,
-        defer_actor_start=True,
-        release_idle_actors_on_completion=True,
-    )
-    downstream = _actor_op(
-        context,
-        upstream,
-        defer_actor_start=True,
-        wait_for_upstream_deferred_operators=True,
-        release_idle_actors_on_completion=True,
-    )
+    original_rules = list(context.custom_physical_optimizer_rule_classes)
 
-    assert downstream.defer_actor_start
-    assert downstream.actor_pool_start_deferred
-    assert downstream.can_add_input()
-    assert not downstream._upstream_deferred_operators_finished()
+    if missing == "candidate":
+        monkeypatch.delattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION")
+    elif missing == "candidate_hook":
+        monkeypatch.delattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control")
+    elif missing == "context":
+        context = _ContextWithoutAdmissionFlag(context)
+    elif missing == "h1":
+        delattr(context, "custom_physical_optimizer_rule_classes")
+    else:
+        monkeypatch.delattr(ParquetDatasource, "get_external_scan_descriptor")
 
-    minimum, maximum = downstream.min_max_resource_requirements()
-    assert minimum == ExecutionResources.zero()
-    assert maximum.gpu == 2
-    assert downstream.min_scheduling_resources() == ExecutionResources.zero()
+    info = compatibility(context)
+    assert not info.supported
+    assert expected_seam in info.missing_seams
 
-    upstream._is_execution_marked_finished = True
-    assert downstream._upstream_deferred_operators_finished()
+    with pytest.raises(RayCompatibilityError):
+        rgf.enable(context=context)
+
+    assert context.get_config(CONFIG_KEY) is None
+    if missing != "h1":
+        assert context.custom_physical_optimizer_rule_classes == original_rules
 
 
-def test_stock_actor_map_can_be_configured_by_a_physical_rule():
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected_seam"),
+    (
+        (
+            GPU_ACTOR_ADMISSION_CONTEXT_ATTR,
+            False,
+            "gpu_actor_admission_disabled",
+        ),
+        (
+            "op_resource_reservation_enabled",
+            False,
+            "gpu_actor_admission_resource_reservation_disabled",
+        ),
+        (
+            "wait_for_min_actors_s",
+            1,
+            "gpu_actor_admission_blocking_actor_start",
+        ),
+    ),
+)
+def test_enable_fails_closed_when_context_selects_a_legacy_actor_mode(
+    attribute, value, expected_seam
+):
     context = DataContext.get_current().copy()
-    source = InputDataBuffer(context, input_data=[])
-    operator = _actor_op(context, source)
+    original_rules = list(context.custom_physical_optimizer_rule_classes)
+    setattr(context, attribute, value)
 
-    assert not operator.defer_actor_start
-    operator.configure_demand_driven_start()
+    info = compatibility(context)
+    assert not info.supported
+    assert expected_seam in info.missing_seams
 
-    assert operator.defer_actor_start
-    assert operator.actor_pool_start_deferred
+    with pytest.raises(RayCompatibilityError):
+        rgf.enable(context=context)
+
+    assert context.custom_physical_optimizer_rule_classes == original_rules
+    assert context.get_config(CONFIG_KEY) is None
 
 
-def test_autoscaler_does_not_restore_deferred_pool_minimum():
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (
+        (GPU_ACTOR_ADMISSION_CONTEXT_ATTR, False),
+        ("op_resource_reservation_enabled", False),
+        ("wait_for_min_actors_s", 1),
+    ),
+)
+def test_planning_fails_closed_if_admission_settings_drift_after_enable(
+    attribute, value
+):
+    from ray_data_gpu_fusion.rules import LowerClosedGPUOperators
+
     context = DataContext.get_current().copy()
-    source = InputDataBuffer(context, input_data=[])
-    operator = _actor_op(context, source, defer_actor_start=True)
-    operator.has_completed = MagicMock(return_value=False)
-    topology = {operator: MagicMock()}
-    autoscaler = DefaultActorAutoscaler(
-        topology,
-        MagicMock(),
-        config=context.autoscaling_config,
-    )
+    rgf.enable(context=context)
+    setattr(context, attribute, value)
+    plan = PhysicalPlan(InputDataBuffer(context, input_data=[]), {}, context)
 
-    request = autoscaler._derive_target_scaling_config(
-        operator._actor_pool,
-        operator,
-        topology[operator],
-    )
-
-    assert request.delta == 0
-    assert request.reason == "waiting for input demand"
+    with pytest.raises(RayCompatibilityError):
+        LowerClosedGPUOperators().apply(plan)
 
 
-def test_waiting_for_upstream_requires_deferred_start():
-    context = DataContext.get_current().copy()
-    source = InputDataBuffer(context, input_data=[])
-
-    with pytest.raises(ValueError, match="requires deferred actor startup"):
-        _actor_op(
-            context,
-            source,
-            wait_for_upstream_deferred_operators=True,
-        )
-
-
-def test_deferred_pool_processes_with_first_ready_actor():
-    class IdentityBatch:
+def test_stock_callable_class_gpu_map_batches_share_one_gpu(one_gpu_context):
+    class IdentityActor:
         def __call__(self, batch):
             return batch
 
-    started_here = not ray.is_initialized()
-    if started_here:
-        ray.init(num_cpus=1, include_dashboard=False)
-    context = DataContext.get_current()
-    previous_rules = list(context.custom_physical_optimizer_rule_classes)
-    context.custom_physical_optimizer_rule_classes = [
-        *previous_rules,
-        _ConfigureDemandDrivenActors,
-    ]
-    try:
-        dataset = ray.data.from_items([{"value": 1}, {"value": 2}]).map_batches(
-            IdentityBatch,
-            batch_format="pyarrow",
-            compute=ActorPoolStrategy(size=2),
-            num_cpus=1,
-        )
-
-        assert dataset.take_all() == [{"value": 1}, {"value": 2}]
-    finally:
-        context.custom_physical_optimizer_rule_classes = previous_rules
-        if started_here:
-            ray.shutdown()
-
-
-def test_two_unfused_actor_regions_share_one_scarce_resource():
-    class IdentityActor:
+    class SecondIdentityActor:
         def __call__(self, batch):
             return batch
 
     def identity_task(batch):
         return batch
 
-    started_here = not ray.is_initialized()
-    if started_here:
-        ray.init(num_cpus=1, include_dashboard=False)
-    context = DataContext.get_current()
-    previous_rules = list(context.custom_physical_optimizer_rule_classes)
-    context.custom_physical_optimizer_rule_classes = [
-        *previous_rules,
-        _ConfigureSequentialDemandDrivenActors,
+    dataset = (
+        ray.data.from_items([{"value": 1}, {"value": 2}])
+        .map_batches(
+            IdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+        .map_batches(
+            identity_task,
+            batch_format="pyarrow",
+            compute=TaskPoolStrategy(size=1),
+            num_cpus=1,
+        )
+        .map_batches(
+            SecondIdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+    )
+
+    actor_regions = [
+        operator
+        for operator in _reachable(optimized_physical_plan(dataset._logical_plan).dag)
+        if isinstance(operator, ActorPoolMapOperator)
     ]
-    try:
-        dataset = (
-            ray.data.from_items([{"value": 1}, {"value": 2}])
-            .map_batches(
-                IdentityActor,
-                batch_format="pyarrow",
-                compute=ActorPoolStrategy(size=1),
-                num_cpus=1,
-            )
-            .map_batches(
-                identity_task,
-                batch_format="pyarrow",
-                compute=TaskPoolStrategy(size=1),
-                num_cpus=1,
-            )
-            .map_batches(
-                IdentityActor,
-                batch_format="pyarrow",
-                compute=ActorPoolStrategy(size=1),
-                num_cpus=1,
-            )
+    assert len(actor_regions) == 2
+    assert all(region.uses_gpu_actor_admission_control() for region in actor_regions)
+
+    assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
+        {"value": 1},
+        {"value": 2},
+    ]
+
+
+def test_plugin_created_gpu_regions_share_one_gpu(monkeypatch, one_gpu_context):
+    import ray_data_gpu_fusion.rules as rules
+
+    class IdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    class SecondIdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    monkeypatch.setattr(rules, "map_eligibility", _plugin_eligibility)
+    rgf.enable(context=one_gpu_context, fusion=False)
+    dataset = (
+        ray.data.from_items([{"value": 1}, {"value": 2}])
+        .map_batches(
+            IdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+        .map_batches(
+            SecondIdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+    )
+
+    physical = optimized_physical_plan(dataset._logical_plan)
+    plugin_regions = [
+        operator
+        for operator in _reachable(physical.dag)
+        if isinstance(operator, ExecutableGPUMapBatchesOperator)
+    ]
+    assert len(plugin_regions) == 2
+    assert all(region._ray_remote_args["num_gpus"] == 1 for region in plugin_regions)
+    assert all(region.uses_gpu_actor_admission_control() for region in plugin_regions)
+
+    assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
+        {"value": 1},
+        {"value": 2},
+    ]
+
+
+def test_incompatible_plugin_gpu_regions_hand_off_one_gpu(monkeypatch, one_gpu_context):
+    import ray_data_gpu_fusion.rules as rules
+
+    class IdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    class SecondIdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    def incompatible_eligibility(logical_op, context: DataContext) -> Eligibility:
+        # A CPU reservation mismatch is an explicit fusion incompatibility, but
+        # both standalone regions still request the same one logical GPU.
+        num_cpus = 0 if logical_op.fn is IdentityActor else 0.25
+        spec = OperatorSpec(
+            (TransformSpec("test_plugin_map", FRAME_STREAM, FRAME_STREAM),),
+            ExecutionRequirements(profile=ExecutionProfile(num_cpus=num_cpus)),
+        )
+        return Eligibility(
+            True,
+            spec=spec,
+            creation_options=CreationOptions(
+                name=f"GPU[{logical_op.name}]",
+                min_rows_per_bundle=logical_op.min_rows_per_bundled_input,
+                target_max_block_size_override=context.target_max_block_size,
+            ),
         )
 
-        assert dataset.take_all() == [{"value": 1}, {"value": 2}]
-        assert dataset.context.get_config("phase0.test.sequential_actor_regions") == 2
-    finally:
-        context.custom_physical_optimizer_rule_classes = previous_rules
-        if started_here:
-            ray.shutdown()
+    monkeypatch.setattr(rules, "map_eligibility", incompatible_eligibility)
+    rgf.enable(context=one_gpu_context)
+    dataset = (
+        ray.data.from_items([{"value": 1}, {"value": 2}])
+        .map_batches(
+            IdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+        .map_batches(
+            SecondIdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0.25,
+        )
+    )
+
+    physical = optimized_physical_plan(dataset._logical_plan)
+    plugin_regions = [
+        operator
+        for operator in _reachable(physical.dag)
+        if isinstance(operator, ExecutableGPUMapBatchesOperator)
+    ]
+    assert len(plugin_regions) == 2
+    assert all(region.uses_gpu_actor_admission_control() for region in plugin_regions)
+
+    assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
+        {"value": 1},
+        {"value": 2},
+    ]
+
+
+def test_plugin_decline_to_stock_gpu_actor_is_admission_safe(
+    monkeypatch, one_gpu_context
+):
+    import ray_data_gpu_fusion.rules as rules
+
+    class PluginIdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    class FallbackIdentityActor:
+        def __call__(self, batch):
+            return batch
+
+    stock_eligibility = rules.map_eligibility
+
+    def selective_eligibility(logical_op, context):
+        if logical_op.fn is PluginIdentityActor:
+            return _plugin_eligibility(logical_op, context)
+        return stock_eligibility(logical_op, context)
+
+    monkeypatch.setattr(rules, "map_eligibility", selective_eligibility)
+    rgf.enable(context=one_gpu_context, fusion=False)
+    dataset = (
+        ray.data.from_items([{"value": 1}, {"value": 2}])
+        .map_batches(
+            PluginIdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+        .map_batches(
+            FallbackIdentityActor,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=1),
+            num_gpus=1,
+            num_cpus=0,
+        )
+    )
+
+    physical = optimized_physical_plan(dataset._logical_plan)
+    operators = _reachable(physical.dag)
+    plugin_regions = [
+        operator
+        for operator in operators
+        if isinstance(operator, ExecutableGPUMapBatchesOperator)
+    ]
+    stock_regions = [
+        operator
+        for operator in operators
+        if isinstance(operator, ActorPoolMapOperator)
+        and not isinstance(operator, ExecutableGPUMapBatchesOperator)
+    ]
+    assert plugin_regions
+    assert stock_regions
+    assert all(
+        region.uses_gpu_actor_admission_control()
+        for region in (*plugin_regions, *stock_regions)
+    )
+
+    assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
+        {"value": 1},
+        {"value": 2},
+    ]

@@ -21,10 +21,15 @@ actions.
 ## Repository layout
 
 - `ray-stock/` is an official Ray submodule pinned to an untouched commit.
-- `ray-patches/` contains the small, backend-neutral Ray extension seams.
+- `ray-pr-candidate/` contains C, the reviewable Ray PR candidate for generic
+  GPU actor admission control.
+- `ray-hooks/` contains exactly two local backend-neutral hooks: H1 adds
+  plan-local physical optimizer rules and H2 adds the Parquet scan descriptor.
 - `plugin/` is the independently packaged `ray-data-gpu-fusion` distribution.
 - `environment/` and `pins/` make the runtime and source provenance repeatable.
-- `scripts/` builds the derived Ray wheel and validates the installation.
+- `wheels/stock/`, `wheels/pr-candidate/`, and `wheels/hooked/` preserve the
+  stock, stock+C, and stock+C+H1+H2 artifacts respectively.
+- `scripts/` builds both derived layers and validates the hooked installation.
 
 See [`docs/design.md`](docs/design.md) for the complete proposal,
 [`docs/architecture.md`](docs/architecture.md) for a compact execution summary,
@@ -38,8 +43,9 @@ independently executable Ray physical operator before optional fusion.
 
 Within a fused region, intermediate frames remain in cuDF. Between unfused
 regions, the closed-operator contract materializes Arrow-backed Ray blocks, and
-demand-driven actor pools hand GPUs from the upstream region to the downstream
-region without eager reservation.
+Ray's generic admission control prevents eligible GPU actor pools with
+statically declared per-actor resources from overcommitting the capacity
+reserved for physical operators.
 
 MapGroupPartitions, range partitioning, preprocessors, expressions, shuffles,
 aggregates, and joins are intentionally outside Phase 0.
@@ -52,11 +58,25 @@ git submodule update --init --recursive
 ./scripts/test.sh
 ```
 
-`.venv` is a Conda prefix despite its conventional name. The bootstrap installs
-the derived Ray wheel and installs `plugin/` editable. It never installs Ray
-from `ray-stock/` in editable mode and never puts the Ray source checkout on
+`.venv` is a Conda prefix despite its conventional name. The bootstrap applies
+C independently, builds `wheels/pr-candidate`, then applies H1/H2 and builds
+`wheels/hooked`. It verifies that the layered hooked wheel is byte-identical to
+a direct stock+C+H1+H2 derivation and installs only the hooked wheel plus an
+editable `plugin/`. It never installs Ray from `ray-stock/` or from the
+intermediate PR-candidate wheel, and never puts the Ray source checkout on
 `PYTHONPATH`. Set `CONDA_EXE=/path/to/conda` if Conda is not discoverable on
 `PATH` or at `/opt/miniconda3/bin/conda`.
+
+## Ray layer provenance
+
+`scripts/build_ray_wheels.py` validates C and H1/H2 independently, keeps
+`ray-stock` clean, records each applied source tree and production-file hash,
+and proves the two hooked-wheel derivations are equal. The required
+`.worktrees/ray-pr-candidate` must be a clean single commit whose parent is the
+stock pin and whose branch, HEAD, subject, and tree match C. Running the builder without
+`--require-pins` prints the exact JSON needed to finalize a missing manifest;
+bootstrap and tests use `--require-pins` and reject missing or placeholder
+provenance.
 
 ## Usage
 
@@ -106,5 +126,5 @@ repository.
 - Python ABI: CPython 3.11, Linux x86-64
 - RAPIDS: 25.12, CUDA 12
 
-See `pins/stock-ray.json` and `pins/source-snapshot.json` for hashes and source
-provenance.
+See `pins/stock-ray.json`, `pins/pr-candidate.json`, `pins/hooked-ray.json`, and
+`pins/source-snapshot.json` for independent layer hashes and source provenance.

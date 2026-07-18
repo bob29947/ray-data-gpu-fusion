@@ -344,7 +344,7 @@ def test_diagnostics_lists_regions_and_stock_refusals(monkeypatch):
     assert "not synchronous" in result
 
 
-def test_lowering_is_executable_and_defers_downstream_stock_gpu_pool():
+def test_lowering_is_executable_and_leaves_stock_gpu_pool_ordinary():
     from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
     from ray.data._internal.logical.interfaces import PhysicalPlan
     from ray.data._internal.logical.operators import InputData, MapBatches
@@ -380,6 +380,7 @@ def test_lowering_is_executable_and_defers_downstream_stock_gpu_pool():
     source = InputDataBuffer(context, input_data=[])
     stock_eligible = plan_udf_map_op(eligible, [source], context)
     stock_downstream = plan_udf_map_op(unsupported, [stock_eligible], context)
+    stock_remote_args = dict(stock_downstream._ray_remote_args)
     plan = PhysicalPlan(
         stock_downstream,
         {stock_eligible: eligible, stock_downstream: unsupported},
@@ -391,9 +392,9 @@ def test_lowering_is_executable_and_defers_downstream_stock_gpu_pool():
     assert isinstance(
         lowered.dag.input_dependencies[0], ExecutableGPUMapBatchesOperator
     )
-    assert lowered.dag.input_dependencies[0].defer_actor_start
-    assert lowered.dag.defer_actor_start
-    assert lowered.dag.actor_pool_start_deferred
+    assert lowered.dag._ray_remote_args == stock_remote_args
+    assert lowered.dag.input_dependencies[0]._ray_remote_args["num_gpus"] == 1
+    assert lowered.dag.input_dependencies[0]._ray_remote_args["num_cpus"] == 0
 
 
 def test_compatible_nodes_fuse_and_incompatible_nodes_remain_executable():
@@ -462,5 +463,5 @@ def test_compatible_nodes_fuse_and_incompatible_nodes_remain_executable():
     result = FuseClosedGPUOperators().apply(incompatible)
     assert isinstance(result.dag, ExecutableGPUMapBatchesOperator)
     assert isinstance(result.dag.input_dependencies[0], ExecutableGPUMapBatchesOperator)
-    assert result.dag.defer_actor_start
-    assert result.dag.input_dependencies[0].defer_actor_start
+    assert result.dag._ray_remote_args["num_gpus"] == 1
+    assert result.dag.input_dependencies[0]._ray_remote_args["num_gpus"] == 1

@@ -11,7 +11,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterable, Optional, Sequence
 
 from ray_data_gpu_fusion._compat import (
-    ActorPoolMapOperator,
     ActorPoolStrategy,
     DataContext,
     FuseOperators,
@@ -28,6 +27,7 @@ from ray_data_gpu_fusion._compat import (
     ray,
     set_input_dependencies,
     set_output_dependencies,
+    verify_compatibility,
 )
 from ray_data_gpu_fusion.config import settings
 from ray_data_gpu_fusion.operators import (
@@ -443,44 +443,6 @@ def _rebuild_outputs(root: PhysicalOperator) -> None:
                 dependency._output_dependencies.append(operator)
 
 
-def _configure_downstream_stock_gpu_actors(root: PhysicalOperator) -> None:
-    """Prevent an unsupported downstream GPU pool from starving its ancestor."""
-
-    memo: dict[PhysicalOperator, bool] = {}
-
-    def has_plugin_ancestor(operator: PhysicalOperator) -> bool:
-        if operator in memo:
-            return memo[operator]
-        value = any(
-            isinstance(dependency, ExecutableGPUOperator)
-            or has_plugin_ancestor(dependency)
-            for dependency in operator.input_dependencies
-        )
-        memo[operator] = value
-        return value
-
-    for operator in _reachable(root):
-        if isinstance(operator, ExecutableGPUOperator):
-            continue
-        if not isinstance(operator, ActorPoolMapOperator):
-            continue
-        remote = getattr(operator, "_ray_remote_args", {})
-        if float(remote.get("num_gpus", 0) or 0) <= 0 or not has_plugin_ancestor(
-            operator
-        ):
-            continue
-        configure = getattr(operator, "configure_demand_driven_start", None)
-        if not callable(configure):
-            raise RuntimeError(
-                "patched Ray ActorPoolMapOperator lacks "
-                "configure_demand_driven_start()"
-            )
-        configure(
-            wait_for_upstream_deferred_operators=True,
-            release_idle_actors_on_completion=True,
-        )
-
-
 class LowerClosedGPUOperators(Rule):
     """Replace eligible stock nodes with independently executable GPU nodes."""
 
@@ -495,6 +457,10 @@ class LowerClosedGPUOperators(Rule):
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
         if not settings(plan.context).enabled:
             return plan
+        # The context can be mutated after enablement. Re-check the complete
+        # candidate+H1+H2 contract at planning time so rollback or legacy actor
+        # settings cannot silently lower a GPU region onto an unmanaged pool.
+        verify_compatibility(plan.context)
         original_ops = _reachable(plan.dag)
         consumers = _consumers(original_ops)
         op_map = plan.op_map.copy()
@@ -595,7 +561,6 @@ class LowerClosedGPUOperators(Rule):
 
         root = rewrite(plan.dag)
         _rebuild_outputs(root)
-        _configure_downstream_stock_gpu_actors(root)
         reachable = set(_reachable(root))
         op_map = {
             operator: logical
@@ -693,6 +658,9 @@ class FuseClosedGPUOperators(Rule):
         current = settings(plan.context)
         if not current.enabled or not current.fusion:
             return plan
+        # Keep this defensive check even though LowerClosedGPUOperators normally
+        # runs first; rules remain independently importable and executable.
+        verify_compatibility(plan.context)
         operators = _reachable(plan.dag)
         regions = _select_regions(operators)
         if not regions:
@@ -744,7 +712,6 @@ class FuseClosedGPUOperators(Rule):
 
         root = rewrite(plan.dag)
         _rebuild_outputs(root)
-        _configure_downstream_stock_gpu_actors(root)
         reachable = set(_reachable(root))
         op_map = {
             operator: logical

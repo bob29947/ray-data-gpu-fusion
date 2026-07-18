@@ -1,10 +1,12 @@
 0d7b5ce80139b104fc40d1901d57c7afb2974861e502267980b37ebea02f9c1c  environment/rapids-25.12-linux-64.explicit.txt
 a9ccb950e57b81ce37448733a94992ea384ca470017be249588bdc3ef45da4ed  environment/ray-runtime-linux-py311.lock
-74d9cae3c999cd88cef446222ca252a7773042730085512565db9e6a313cef60  pins/patched-ray.json
 5f9d70191fd519c884e44cad1d169efd2fe405495bceb1aeedc2820af28cbc5b  pins/stock-ray.json
 ea48df721b40a0a3acb6264d346c7bd977ee85cb8de3f2b0ed08c39f55150b86  pins/source-snapshot.json
-1c083b73024947190c38e9b0b209b0d8e0b7c6c6358f72de254883b41f456c35  ray-patches/0001-ray-data-support-plan-local-physical-optimizer-rules.patch
-b392bbf4b1762c10ba153e643df7e20302083a65b799c0fc35cb85ba17d1010b  ray-patches/0002-ray-data-expose-backend-neutral-parquet-scan-descrip.patch
-2b5a22a967511b08ff85c46d5f0802253a8b869c720466b87dae30da3c3f21c8  ray-patches/0003-ray-data-add-demand-driven-actor-pool-lifecycle.patch
-44fbfe7202da9fa50a71caedc12f91270ba234bcbc9bcd4880d9338a4a0b4638  wheels/patched/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
+d4b2400584b929a4d5b0712ab2886326c5eab72056f876b9f47a213f8ad9dc5f  ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch
+edabe51cc36d1a8569def4673e4a193831452fa2543307ab558892a70b29bc9a  ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch
+21790c188591e459ce271baca4ef06246276c31c1a1941723cb095ef0abd60ad  ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch
+2cea96f5d9c699970cffa53a9d36e99107862099bca03f3ca9bb2dc8986251e6  pins/pr-candidate.json
+76bd4c28b85f3d96aa916e0f6bf2bae6ea4e308fff2a43f91b6da020ce2b0d57  pins/hooked-ray.json
 fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea  wheels/stock/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
+371787e29e1c84e134e7c9354dbd63037b0c268cdd3869dda0cbf20b8c45ee6b  wheels/pr-candidate/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
+602b1137325b498e921a2fdac088a90e6eab44a865ab3dfabf42e85de53d4981  wheels/hooked/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl

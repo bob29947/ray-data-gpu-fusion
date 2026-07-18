@@ -4,6 +4,12 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python="$root/.venv/bin/python"
 
+"$python" "$root/scripts/build_ray_wheels.py" --require-pins
+acceptance_args=()
+if [[ "${RAY_ACCEPTANCE_SKIP_SPILL:-0}" == "1" ]]; then
+  acceptance_args+=(--skip-spill)
+fi
+"$python" "$root/scripts/run_ray_acceptance.py" "${acceptance_args[@]}"
 "$python" "$root/scripts/verify_install.py"
 "$python" -m pytest -q \
   "$root/plugin/tests/unit" \

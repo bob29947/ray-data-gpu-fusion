@@ -1,11 +1,11 @@
-.PHONY: bootstrap verify test unit integration gpu wheel smoke
+.PHONY: bootstrap verify test unit integration gpu ray-wheels wheel smoke
 
 PYTHON := .venv/bin/python
 
 bootstrap:
 	./scripts/bootstrap.sh
 
-verify:
+verify: ray-wheels
 	$(PYTHON) scripts/verify_install.py
 
 test:
@@ -20,8 +20,10 @@ integration:
 gpu:
 	CUDA_VISIBLE_DEVICES=$${CUDA_VISIBLE_DEVICES:-0} $(PYTHON) -m pytest -q -m gpu plugin/tests
 
-wheel:
-	$(PYTHON) scripts/build_patched_ray_wheel.py
+ray-wheels:
+	$(PYTHON) scripts/build_ray_wheels.py --require-pins
+
+wheel: ray-wheels
 	$(PYTHON) -m pip wheel --no-deps --no-build-isolation --wheel-dir dist ./plugin
 
 smoke:
