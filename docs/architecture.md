@@ -126,12 +126,13 @@ refusal reasons.
 The pinned stock checkout is immutable. Derived Ray is split into two auditable
 layers:
 
-1. C is the standalone PR candidate for generic, resource-aware GPU actor
-   admission control. It exposes capability version 1 and an internal
-   `DataContext` rollback field. It applies to GPU actor pools with statically
-   declared per-actor resources when operator reservation is enabled,
-   `wait_for_min_actors_s <= 0`, and no user-supplied dynamic
-   `ray_remote_args_fn` is configured; it contains no plugin dependency.
+1. C is the standalone PR candidate for generic resource admission. It exposes
+   capability version 1 and an internal `DataContext` rollback field. Today it
+   adapts statically declared GPU actor pools and atomic GPU shuffle/hash-
+   aggregate gangs. Safety floors remain enabled without proportional operator
+   reservation, minimum-actor readiness is asynchronous after admission, and a
+   user-supplied dynamic `ray_remote_args_fn` retains legacy scheduling with a
+   warning; C contains no plugin dependency.
 2. H1 adds plan-local physical optimizer rule classes on `DataContext`.
 3. H2 adds a conservative Parquet external-scan descriptor that performs no
    I/O.

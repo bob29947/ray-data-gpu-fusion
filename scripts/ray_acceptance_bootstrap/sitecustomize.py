@@ -50,8 +50,13 @@ def _assert_wheel_backed_production(venv: Path, layer: str) -> None:
         "ray.data.context",
         "ray.data._internal.actor_autoscaler.default_actor_autoscaler",
         "ray.data._internal.execution.operators.actor_pool_map_operator",
+        "ray.data._internal.execution.interfaces.physical_operator",
+        "ray.data._internal.execution.resource_admission",
         "ray.data._internal.execution.resource_manager",
+        "ray.data._internal.execution.streaming_executor",
         "ray.data._internal.execution.streaming_executor_state",
+        "ray.data._internal.gpu_shuffle.hash_aggregate",
+        "ray.data._internal.gpu_shuffle.hash_shuffle",
         "ray.data._internal.logical.optimizers",
         "ray.data._internal.datasource.parquet_datasource",
     )
@@ -71,23 +76,46 @@ def _assert_wheel_backed_production(venv: Path, layer: str) -> None:
     actor_pool = imported[
         "ray.data._internal.execution.operators.actor_pool_map_operator"
     ]
+    physical_operator = imported[
+        "ray.data._internal.execution.interfaces.physical_operator"
+    ]
+    resource_admission = imported["ray.data._internal.execution.resource_admission"]
+    gpu_shuffle = imported["ray.data._internal.gpu_shuffle.hash_shuffle"]
     parquet = imported["ray.data._internal.datasource.parquet_datasource"]
 
-    if getattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION", None) != 1:
-        raise RuntimeError("installed Ray lacks candidate admission capability v1")
-    if not callable(
-        getattr(
-            actor_pool.ActorPoolMapOperator, "uses_gpu_actor_admission_control", None
-        )
+    if getattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION", None) != 1:
+        raise RuntimeError("installed Ray lacks resource admission capability v1")
+    if not hasattr(resource_admission, "AdmissionKind"):
+        raise RuntimeError("installed Ray lacks generic resource admission types")
+    if {kind.value for kind in resource_admission.AdmissionKind} != {
+        "transient",
+        "elastic_pool",
+        "fixed_gang",
+    }:
+        raise RuntimeError("installed Ray has unexpected resource admission kinds")
+    for hook in (
+        "resource_admission_spec",
+        "has_internal_admission_demand",
+        "apply_resource_admission_grant",
+        "can_release_resource_admission",
     ):
-        raise RuntimeError("installed Ray lacks candidate actor-pool capability")
+        if not callable(getattr(physical_operator.PhysicalOperator, hook, None)):
+            raise RuntimeError(f"installed Ray lacks PhysicalOperator.{hook}()")
+    if not callable(
+        actor_pool.ActorPoolMapOperator.__dict__.get("resource_admission_spec")
+    ):
+        raise RuntimeError("installed Ray lacks actor-pool admission adapter")
+    if not callable(
+        gpu_shuffle.GPUShuffleOperator.__dict__.get("resource_admission_spec")
+    ):
+        raise RuntimeError("installed Ray lacks GPU-shuffle gang admission adapter")
     if not isinstance(
         getattr(
-            context_module.DataContext(), "_enable_gpu_actor_admission_control", None
+            context_module.DataContext(), "_enable_resource_admission_control", None
         ),
         bool,
     ):
-        raise RuntimeError("installed Ray lacks the candidate rollback flag")
+        raise RuntimeError("installed Ray lacks the resource admission rollback flag")
 
     context_has_h1 = hasattr(
         context_module.DataContext(), "custom_physical_optimizer_rule_classes"

@@ -9,14 +9,35 @@
 | Linear compatible chain | Matching execution and payload contracts | One fused Ray actor-pool operator |
 | Linear incompatible chain | Any contract differs | Separate admission-controlled Ray actor pools with Arrow blocks between them |
 
-Everything else remains on its stock Ray implementation.
+Everything else remains on its stock Ray implementation. The generic resource
+admission contract below changes when supported stock GPU resource owners may
+acquire resources; it does not make those APIs plugin fusion candidates.
 
-Eligible GPU actor pools with statically declared per-actor resources use Ray's
-capability-version-1 admission controller when operator reservation is enabled,
-`wait_for_min_actors_s <= 0`, and no user-supplied dynamic `ray_remote_args_fn`
-is configured.
-Fixed and autoscaling pool sizes are both eligible. Unsupported or internally
-disabled cases retain stock actor behavior.
+## Ray resource-admission coverage
+
+Candidate C exposes internal resource-admission capability version 1. The
+first production adapters cover these physical resource owners:
+
+| Ray Data operation | Physical owner | Admission behavior |
+| --- | --- | --- |
+| Actor-based GPU `map_batches()` | `ActorPoolMapOperator` | Elastic pool with a one-complete-actor progress floor and scaling capped by its grant |
+| Actor-based `map_groups(batch_format="cudf")` | The same `ActorPoolMapOperator` adapter | Elastic pool; cuDF conversion remains inside each per-group actor call |
+| GPU shuffle | `GPUShuffleOperator` rank pool | One atomic fixed gang containing every configured rank |
+| GPU hash aggregate | GPU shuffle base implementation | The same fixed-gang lifecycle, inherited without a controller special case |
+
+The complete shuffle gang is one admission floor. Actor pools defer worker
+startup until admitted, while a shuffle placement group becomes usable only
+after every rank is ready. Fixed and autoscaling actor pools are both eligible.
+`wait_for_min_actors_s` readiness is tracked asynchronously after admission, so
+it does not block topology construction.
+
+Deadlock-safety floors remain active when
+`op_resource_reservation_enabled=False`; that setting controls proportional
+sharing, not admission safety. A GPU actor pool with a user-supplied dynamic
+`ray_remote_args_fn` and no static resource envelope, a GPU task, or another
+GPU operator without an admission specification keeps legacy scheduling and
+emits a once-per-execution warning that deadlock protection does not apply.
+The internal `DataContext` rollback field can disable candidate C as a whole.
 
 ## Intentionally deferred
 
@@ -25,7 +46,10 @@ disabled cases retain stock actor behavior.
   boundaries may overlap only when Ray admits both actor pools);
 - DataSource V2 Parquet recognition;
 - scalar-expression and preprocessor adapters;
-- partitioning, grouped partitions, shuffles, sort, aggregate, join, and zip;
+- plugin-native lowering or fusion for grouped partitions, shuffles, sort,
+  aggregate, join, and zip (stock actor-based cuDF `map_groups`, GPU shuffle,
+  and GPU hash aggregate still receive the admission behavior above);
+- admission gating for GPU task pools and undeclared future GPU operators;
 - multi-GPU work inside one actor;
 - asynchronous or concurrently invoked UDFs;
 - custom object-store or scheduler behavior.

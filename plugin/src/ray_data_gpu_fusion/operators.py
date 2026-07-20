@@ -13,6 +13,7 @@ from ray_data_gpu_fusion._compat import (
     MapTransformer,
     PhysicalOperator,
     RuntimeEnv,
+    require_elastic_resource_admission,
     stock_map_transformer,
 )
 from ray_data_gpu_fusion.runtime import (
@@ -163,6 +164,7 @@ class ActorPoolGPUOperator(ActorPoolMapOperator, ExecutableGPUOperator):
                 creation_options.target_max_block_size_override
             ),
         )
+        require_elastic_resource_admission(self)
 
     @property
     def gpu_execution_spec(self) -> OperatorSpec:
@@ -199,6 +201,7 @@ class ExecutableGPUMapBatchesOperator(ActorPoolMapOperator, ExecutableGPUOperato
                 data_context, "default_map_logical_memory_enabled", False
             ),
         )
+        require_elastic_resource_admission(self)
 
 
 class BackendFactory(Protocol):

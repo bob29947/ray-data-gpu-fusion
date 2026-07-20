@@ -4,44 +4,56 @@
   "base_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
   "base_version": "3.0.0.dev0",
   "stock_wheel_sha256": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
-  "local_commit": "ede9354c70e7e27afb5105abf3b406c6c9a4be31",
+  "local_commit": "afa776daadf514a1ba16821c8691088bcc2de78e",
   "patch": {
-    "file": "ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch",
-    "from_commit": "ede9354c70e7e27afb5105abf3b406c6c9a4be31",
-    "sha256": "d4b2400584b929a4d5b0712ab2886326c5eab72056f876b9f47a213f8ad9dc5f"
+    "file": "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch",
+    "from_commit": "afa776daadf514a1ba16821c8691088bcc2de78e",
+    "sha256": "016087d0f2254fe7cdfd8f7bbda412d9b400bc48d7cc0d11461e12a35c65bad6"
   },
-  "patch_series_sha256": "896e20273cba157a645f3ecfe976be7f85b12d3739c9c134810f918cde09b113",
-  "source_tree": "4a3491f6e85ebaffb53308067bd63fadfbffcc01",
+  "patch_series_sha256": "257c75f7084c007bf8cdc2287d972b91aa2df1063c637f7590130535060b8d38",
+  "source_tree": "3f2078993137bb2fd14f57e1626a195b7e794ab3",
   "changed_files": [
-    "doc/source/data/release-notes/gpu-actor-admission-control.md",
+    "doc/source/data/release-notes/resource-admission-control.md",
     "python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py",
+    "python/ray/data/_internal/execution/interfaces/physical_operator.py",
     "python/ray/data/_internal/execution/operators/actor_pool_map_operator.py",
+    "python/ray/data/_internal/execution/resource_admission.py",
     "python/ray/data/_internal/execution/resource_manager.py",
+    "python/ray/data/_internal/execution/streaming_executor.py",
     "python/ray/data/_internal/execution/streaming_executor_state.py",
+    "python/ray/data/_internal/gpu_shuffle/hash_aggregate.py",
+    "python/ray/data/_internal/gpu_shuffle/hash_shuffle.py",
     "python/ray/data/context.py",
     "python/ray/data/tests/test_actor_pool_map_operator.py",
     "python/ray/data/tests/test_autoscaler.py",
+    "python/ray/data/tests/test_gpu_aggregate.py",
+    "python/ray/data/tests/test_gpu_shuffle.py",
     "python/ray/data/tests/test_map_operator.py",
     "python/ray/data/tests/test_reservation_based_resource_allocator.py",
     "python/ray/data/tests/test_resource_manager.py",
     "python/ray/data/tests/test_streaming_executor.py"
   ],
   "loc": {
-    "insertions": 1709,
-    "deletions": 33
+    "insertions": 3156,
+    "deletions": 255
   },
   "production_delta": {
     "files": {
-      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "a6bb7580bbbaf353ef57300e45f05164f6e18090cf1b67b1b3b6a556bddf0606",
-      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "19e1cf5c85d7d1f9557160440fd4e52b80fd9fe8c8b71cf759868f8b2c3726fb",
-      "ray/data/_internal/execution/resource_manager.py": "5ab0186f6cf06edc4b4c8f138ff69439e1affcdbcb99b2ace9257fafd52f15fd",
-      "ray/data/_internal/execution/streaming_executor_state.py": "1d2a6f214612470d8e10bf1de0880e6b53d3cd8c64deb6c8e7130252fa486fd8",
-      "ray/data/context.py": "3898f91e4830935a56401ae431de71bcb98252f4a670e89bba8a1048c4e3bd00"
+      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "48e1ada5cad1b3bc0c83a4c73196552934c1e0e249df8294531987d3e4568316",
+      "ray/data/_internal/execution/interfaces/physical_operator.py": "aab0ae46dbb34ea451cd6ea1b90835ca3f137a1ce54c91488de38875b47e1767",
+      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "5ff098dfb4e6b50b1a4b910c155f0c6ac39dc88402f506248d8b9e90b0682f2c",
+      "ray/data/_internal/execution/resource_admission.py": "92954b09f6213df25332533c8138815546b0e6f6075219eaa7ab36bccc0c816c",
+      "ray/data/_internal/execution/resource_manager.py": "8702d84db60dca04ce8afa2a4f5b92e2197f69852dd6b62c4242ad85f95c79b9",
+      "ray/data/_internal/execution/streaming_executor.py": "e00af1085837c5220a0c727496fd63e6af567d3d88eaa215c3393282d1574b33",
+      "ray/data/_internal/execution/streaming_executor_state.py": "2b6cafc691f3cecfbe1616b80c68e50823210276de63be911e45b0cd565a6dbd",
+      "ray/data/_internal/gpu_shuffle/hash_aggregate.py": "d007c54c1440eca13437965daa3fbc5e24f9802a6e508d22df3689222c438be4",
+      "ray/data/_internal/gpu_shuffle/hash_shuffle.py": "b6133b5f11b118df2e0c0591ea73a7d2120a96276e81373747b8f956338da939",
+      "ray/data/context.py": "80559012fde7516f0c302541f24f0daa3a408370aab497319a40e60ef8b53a46"
     },
     "removed": []
   },
   "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
-  "wheel_sha256": "371787e29e1c84e134e7c9354dbd63037b0c268cdd3869dda0cbf20b8c45ee6b",
-  "wheel_size_bytes": 40325135,
+  "wheel_sha256": "a72555129018bfd81de7bd6a3c30d556b884d0a40ea94be06e9b057a2a831a3d",
+  "wheel_size_bytes": 40328190,
   "build": "scripts/build_ray_wheels.py"
 }

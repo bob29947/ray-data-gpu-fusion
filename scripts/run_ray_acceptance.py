@@ -24,23 +24,9 @@ VENV = (ROOT / ".venv").resolve()
 TEST_RAY_ROOT = ROOT / ".worktrees" / "ray-pr-candidate" / "python" / "ray"
 BOOTSTRAP = ROOT / "scripts" / "ray_acceptance_bootstrap"
 
-ADMISSION_MATCH = "gpu_actor"
-SUPPORTING_TESTS = (
-    "test_actor_pool_map_operator.py::test_actor_pool_input_queue_draining",
-    "test_resource_manager.py::TestOutputBackpressureGuard::"
-    "test_unblock_for_admission_managed_actor_without_runnable_actor",
-    "test_streaming_executor.py::test_get_eligible_operators_to_run",
-    "test_reservation_based_resource_allocator.py::"
-    "TestReservationOpResourceAllocator::test_reserve_min_resources_for_gpu_ops",
-    "test_reservation_based_resource_allocator.py::"
-    "TestReservationOpResourceAllocator::"
-    "test_actor_pool_gpu_operator_gets_gpu_budget_in_cpu_pipeline",
-    "test_map_operator.py::test_map_operator_ray_args",
-    "test_map_operator.py::test_map_operator_shutdown",
-)
 SPILL_TEST = (
     "test_actor_pool_map_operator.py::"
-    "test_gpu_actor_admission_handoff_spills_arrow_blocks"
+    "test_resource_admission_handoff_spills_arrow_blocks"
 )
 
 
@@ -128,6 +114,10 @@ def _install(wheel: Path) -> None:
 
 def _test_environment(layer: str) -> dict[str, str]:
     data_tests = TEST_RAY_ROOT / "data" / "tests"
+    ray_tmpdir = Path(
+        os.environ.get("RAY_GPU_ACCEPTANCE_TMPDIR", "/dev/shm/ray-admission")
+    )
+    ray_tmpdir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     # Do not retain an ambient source checkout on PYTHONPATH. The bootstrap
     # exposes exactly the test packages plus the top-level test module path used
@@ -138,6 +128,7 @@ def _test_environment(layer: str) -> dict[str, str]:
             "RAY_GPU_ACCEPTANCE_TEST_ROOT": str(TEST_RAY_ROOT),
             "RAY_GPU_ACCEPTANCE_VENV": str(VENV),
             "RAY_GPU_ACCEPTANCE_LAYER": layer,
+            "RAY_TMPDIR": str(ray_tmpdir),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
@@ -200,19 +191,18 @@ def _run_tests(layer: str, *, skip_spill: bool) -> None:
     # The manifest supplies changed test modules so newly added admission tests
     # are automatically covered after a candidate amend. Keep the large spill
     # case separate so developers can explicitly omit only that one test.
-    admission_match = f"({ADMISSION_MATCH}) and not handoff_spills_arrow_blocks"
-    _pytest(
-        layer,
-        "candidate admission tests",
-        _candidate_test_files(),
-        "-k",
-        admission_match,
-    )
-    _pytest(
-        layer,
-        "modified stock-regression tests",
-        [data_tests / node_id for node_id in SUPPORTING_TESTS],
-    )
+    # Ray's module-scoped cluster fixtures are not reliable when these otherwise
+    # independent suites share one pytest process, so isolate each changed module.
+    for test_file in _candidate_test_files():
+        _pytest(
+            layer,
+            test_file.name,
+            [test_file],
+            "-m",
+            "not gpu",
+            "-k",
+            "not resource_admission_handoff_spills_arrow_blocks",
+        )
     if not skip_spill:
         _pytest(layer, "low-object-store spill E2E", [data_tests / SPILL_TEST])
 

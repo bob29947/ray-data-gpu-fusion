@@ -16,6 +16,7 @@ from ray.runtime_env import RuntimeEnv
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
 from ray.data._internal.execution import resource_manager
+from ray.data._internal.execution.resource_admission import AdmissionKind
 from ray.data._internal.execution.interfaces import (
     BlockEntry,
     PhysicalOperator,
@@ -47,8 +48,8 @@ from ray.util.rpdb import _is_ray_debugger_post_mortem_enabled
 
 PINNED_RAY_COMMIT = "2741c6461d2bd3e5ff114af67be7a1190453dadd"
 PHYSICAL_RULE_CLASSES_ATTR = "custom_physical_optimizer_rule_classes"
-GPU_ACTOR_ADMISSION_CONTEXT_ATTR = "_enable_gpu_actor_admission_control"
-GPU_ACTOR_ADMISSION_CONTROL_VERSION = 1
+RESOURCE_ADMISSION_CONTEXT_ATTR = "_enable_resource_admission_control"
+RESOURCE_ADMISSION_CONTROL_VERSION = 1
 
 
 class RayCompatibilityError(RuntimeError):
@@ -75,27 +76,20 @@ def compatibility(context: DataContext | None = None) -> CompatibilityInfo:
     if not hasattr(selected, PHYSICAL_RULE_CLASSES_ATTR):
         missing.append("plan_local_physical_rules")
     if (
-        getattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION", None)
-        != GPU_ACTOR_ADMISSION_CONTROL_VERSION
+        getattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION", None)
+        != RESOURCE_ADMISSION_CONTROL_VERSION
     ):
-        missing.append("gpu_actor_admission_control_v1")
-    if not callable(
-        getattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control", None)
-    ):
-        missing.append("gpu_actor_admission_candidate_hook")
-    if not hasattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR):
-        missing.append("gpu_actor_admission_context")
-    elif getattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is not True:
-        missing.append("gpu_actor_admission_disabled")
-    if getattr(selected, "op_resource_reservation_enabled", None) is not True:
-        missing.append("gpu_actor_admission_resource_reservation_disabled")
-    wait_for_min_actors_s = getattr(selected, "wait_for_min_actors_s", None)
-    if wait_for_min_actors_s is None or wait_for_min_actors_s > 0:
-        missing.append("gpu_actor_admission_blocking_actor_start")
+        missing.append("resource_admission_control_v1")
+    if not callable(ActorPoolMapOperator.__dict__.get("resource_admission_spec")):
+        missing.append("actor_pool_resource_admission_spec")
+    if not hasattr(selected, RESOURCE_ADMISSION_CONTEXT_ATTR):
+        missing.append("resource_admission_context")
+    elif getattr(selected, RESOURCE_ADMISSION_CONTEXT_ATTR) is not True:
+        missing.append("resource_admission_disabled")
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
         missing.append("parquet_external_scan_descriptor")
     return CompatibilityInfo(
-        adapter="ray-2741c646-phase0-admission-v1",
+        adapter="ray-2741c646-phase0-resource-admission-v1",
         ray_version=str(getattr(ray, "__version__", "unknown")),
         ray_commit=commit,
         supported=not missing,
@@ -120,40 +114,41 @@ def verify_compatibility(context: DataContext | None = None) -> None:
             "patch (DataContext.custom_physical_optimizer_rule_classes)"
         )
 
-    version = getattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION", None)
-    if version != GPU_ACTOR_ADMISSION_CONTROL_VERSION:
+    version = getattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION", None)
+    if version != RESOURCE_ADMISSION_CONTROL_VERSION:
         raise RayCompatibilityError(
-            "Ray lacks generic GPU actor admission control version "
-            f"{GPU_ACTOR_ADMISSION_CONTROL_VERSION}; found {version!r}"
+            "Ray lacks generic resource admission control version "
+            f"{RESOURCE_ADMISSION_CONTROL_VERSION}; found {version!r}"
         )
-    if not callable(
-        getattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control", None)
-    ):
+    if not callable(ActorPoolMapOperator.__dict__.get("resource_admission_spec")):
         raise RayCompatibilityError(
-            "Ray lacks ActorPoolMapOperator.uses_gpu_actor_admission_control()"
+            "Ray lacks ActorPoolMapOperator.resource_admission_spec()"
         )
 
-    if not hasattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR):
+    if not hasattr(selected, RESOURCE_ADMISSION_CONTEXT_ATTR):
         raise RayCompatibilityError(
-            "Ray lacks DataContext._enable_gpu_actor_admission_control"
+            "Ray lacks DataContext._enable_resource_admission_control"
         )
-    if getattr(selected, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is not True:
+    if getattr(selected, RESOURCE_ADMISSION_CONTEXT_ATTR) is not True:
         raise RayCompatibilityError(
-            "DataContext._enable_gpu_actor_admission_control must be True"
-        )
-    if getattr(selected, "op_resource_reservation_enabled", None) is not True:
-        raise RayCompatibilityError(
-            "DataContext.op_resource_reservation_enabled must be True"
-        )
-    wait_for_min_actors_s = getattr(selected, "wait_for_min_actors_s", None)
-    if wait_for_min_actors_s is None or wait_for_min_actors_s > 0:
-        raise RayCompatibilityError(
-            "DataContext.wait_for_min_actors_s must be nonpositive"
+            "DataContext._enable_resource_admission_control must be True"
         )
 
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
         raise RayCompatibilityError(
             "Ray lacks ParquetDatasource.get_external_scan_descriptor()"
+        )
+
+
+def require_elastic_resource_admission(operator: PhysicalOperator) -> None:
+    """Require a plugin GPU region to participate as an elastic resource pool."""
+
+    spec = operator.resource_admission_spec()
+    if spec is None or spec.kind is not AdmissionKind.ELASTIC_POOL:
+        kind = None if spec is None else spec.kind
+        raise RayCompatibilityError(
+            f"{operator.name} must provide ELASTIC_POOL resource admission; "
+            f"found {kind!r}"
         )
 
 
@@ -210,6 +205,7 @@ def optimized_physical_plan(logical_plan: Any) -> PhysicalPlan:
 __all__ = [
     "ActorPoolMapOperator",
     "ActorPoolStrategy",
+    "AdmissionKind",
     "Block",
     "BlockAccessor",
     "BlockEntry",
@@ -218,8 +214,8 @@ __all__ = [
     "CompatibilityInfo",
     "DataContext",
     "FuseOperators",
-    "GPU_ACTOR_ADMISSION_CONTEXT_ATTR",
-    "GPU_ACTOR_ADMISSION_CONTROL_VERSION",
+    "RESOURCE_ADMISSION_CONTEXT_ATTR",
+    "RESOURCE_ADMISSION_CONTROL_VERSION",
     "InputDataBuffer",
     "LogicalOptimizer",
     "MapBatches",
@@ -246,6 +242,7 @@ __all__ = [
     "logical_operators",
     "optimized_physical_plan",
     "ray",
+    "require_elastic_resource_admission",
     "set_input_dependencies",
     "set_output_dependencies",
     "set_rule_classes",

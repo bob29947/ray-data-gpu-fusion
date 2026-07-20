@@ -21,9 +21,10 @@ from ray.data._internal.logical.optimizers import PhysicalOptimizer
 from ray.data._internal.logical.operators import Read
 from ray.data.context import DataContext
 from ray_data_gpu_fusion._compat import (
-    GPU_ACTOR_ADMISSION_CONTEXT_ATTR,
-    GPU_ACTOR_ADMISSION_CONTROL_VERSION,
+    AdmissionKind,
     ParquetDatasource,
+    RESOURCE_ADMISSION_CONTEXT_ATTR,
+    RESOURCE_ADMISSION_CONTROL_VERSION,
     RayCompatibilityError,
     compatibility,
     optimized_physical_plan,
@@ -57,7 +58,7 @@ class _ContextWithoutAdmissionFlag:
         self._delegate = delegate
 
     def __getattr__(self, name):
-        if name == GPU_ACTOR_ADMISSION_CONTEXT_ATTR:
+        if name == RESOURCE_ADMISSION_CONTEXT_ATTR:
             raise AttributeError(name)
         return getattr(self._delegate, name)
 
@@ -102,19 +103,13 @@ def one_gpu_context():
 
     context = DataContext.get_current()
     previous_rules = list(context.custom_physical_optimizer_rule_classes)
-    previous_admission = getattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR)
-    previous_reservation = context.op_resource_reservation_enabled
-    previous_wait = context.wait_for_min_actors_s
-    setattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR, True)
-    context.op_resource_reservation_enabled = True
-    context.wait_for_min_actors_s = -1
+    previous_admission = getattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR)
+    setattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR, True)
     try:
         yield context
     finally:
         context.custom_physical_optimizer_rule_classes = previous_rules
-        setattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR, previous_admission)
-        context.op_resource_reservation_enabled = previous_reservation
-        context.wait_for_min_actors_s = previous_wait
+        setattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR, previous_admission)
         context.remove_config(CONFIG_KEY)
         if started_here:
             ray.shutdown()
@@ -128,10 +123,10 @@ def test_required_hooks_and_generic_gpu_admission_capability_are_available():
     assert info.supported
     assert info.missing_seams == ()
     assert (
-        resource_manager.GPU_ACTOR_ADMISSION_CONTROL_VERSION
-        == GPU_ACTOR_ADMISSION_CONTROL_VERSION
+        resource_manager.RESOURCE_ADMISSION_CONTROL_VERSION
+        == RESOURCE_ADMISSION_CONTROL_VERSION
     )
-    assert getattr(context, GPU_ACTOR_ADMISSION_CONTEXT_ATTR) is True
+    assert getattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR) is True
 
 
 def test_plugin_source_does_not_reference_the_legacy_actor_lifecycle_seam():
@@ -146,6 +141,9 @@ def test_plugin_source_does_not_reference_the_legacy_actor_lifecycle_seam():
         "wait_for_upstream_deferred_operators",
         "release_idle_actors_on_completion",
         "configure_demand_driven_start",
+        "GPU_ACTOR_ADMISSION_CONTROL_VERSION",
+        "uses_gpu_actor_admission_control",
+        "_enable_gpu_actor_admission_control",
     ):
         assert symbol not in source
 
@@ -210,9 +208,9 @@ def test_default_public_parquet_read_has_external_scan_descriptor(tmp_path):
 @pytest.mark.parametrize(
     ("missing", "expected_seam"),
     (
-        ("candidate", "gpu_actor_admission_control_v1"),
-        ("candidate_hook", "gpu_actor_admission_candidate_hook"),
-        ("context", "gpu_actor_admission_context"),
+        ("candidate", "resource_admission_control_v1"),
+        ("candidate_hook", "actor_pool_resource_admission_spec"),
+        ("context", "resource_admission_context"),
         ("h1", "plan_local_physical_rules"),
         ("h2", "parquet_external_scan_descriptor"),
     ),
@@ -224,9 +222,9 @@ def test_enable_fails_closed_when_a_required_capability_is_missing(
     original_rules = list(context.custom_physical_optimizer_rule_classes)
 
     if missing == "candidate":
-        monkeypatch.delattr(resource_manager, "GPU_ACTOR_ADMISSION_CONTROL_VERSION")
+        monkeypatch.delattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION")
     elif missing == "candidate_hook":
-        monkeypatch.delattr(ActorPoolMapOperator, "uses_gpu_actor_admission_control")
+        monkeypatch.delattr(ActorPoolMapOperator, "resource_admission_spec")
     elif missing == "context":
         context = _ContextWithoutAdmissionFlag(context)
     elif missing == "h1":
@@ -246,36 +244,14 @@ def test_enable_fails_closed_when_a_required_capability_is_missing(
         assert context.custom_physical_optimizer_rule_classes == original_rules
 
 
-@pytest.mark.parametrize(
-    ("attribute", "value", "expected_seam"),
-    (
-        (
-            GPU_ACTOR_ADMISSION_CONTEXT_ATTR,
-            False,
-            "gpu_actor_admission_disabled",
-        ),
-        (
-            "op_resource_reservation_enabled",
-            False,
-            "gpu_actor_admission_resource_reservation_disabled",
-        ),
-        (
-            "wait_for_min_actors_s",
-            1,
-            "gpu_actor_admission_blocking_actor_start",
-        ),
-    ),
-)
-def test_enable_fails_closed_when_context_selects_a_legacy_actor_mode(
-    attribute, value, expected_seam
-):
+def test_enable_fails_closed_when_resource_admission_is_disabled():
     context = DataContext.get_current().copy()
     original_rules = list(context.custom_physical_optimizer_rule_classes)
-    setattr(context, attribute, value)
+    setattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR, False)
 
     info = compatibility(context)
     assert not info.supported
-    assert expected_seam in info.missing_seams
+    assert "resource_admission_disabled" in info.missing_seams
 
     with pytest.raises(RayCompatibilityError):
         rgf.enable(context=context)
@@ -284,26 +260,30 @@ def test_enable_fails_closed_when_context_selects_a_legacy_actor_mode(
     assert context.get_config(CONFIG_KEY) is None
 
 
-@pytest.mark.parametrize(
-    ("attribute", "value"),
-    (
-        (GPU_ACTOR_ADMISSION_CONTEXT_ATTR, False),
-        ("op_resource_reservation_enabled", False),
-        ("wait_for_min_actors_s", 1),
-    ),
-)
-def test_planning_fails_closed_if_admission_settings_drift_after_enable(
-    attribute, value
-):
+def test_planning_fails_closed_if_resource_admission_is_disabled_after_enable():
     from ray_data_gpu_fusion.rules import LowerClosedGPUOperators
 
     context = DataContext.get_current().copy()
     rgf.enable(context=context)
-    setattr(context, attribute, value)
+    setattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR, False)
     plan = PhysicalPlan(InputDataBuffer(context, input_data=[]), {}, context)
 
     with pytest.raises(RayCompatibilityError):
         LowerClosedGPUOperators().apply(plan)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (
+        ("op_resource_reservation_enabled", False),
+        ("wait_for_min_actors_s", 1),
+    ),
+)
+def test_generic_admission_supports_previous_actor_mode_restrictions(attribute, value):
+    context = DataContext.get_current().copy()
+    setattr(context, attribute, value)
+
+    assert compatibility(context).supported
 
 
 def test_stock_callable_class_gpu_map_batches_share_one_gpu(one_gpu_context):
@@ -350,7 +330,10 @@ def test_stock_callable_class_gpu_map_batches_share_one_gpu(one_gpu_context):
         if isinstance(operator, ActorPoolMapOperator)
     ]
     assert len(actor_regions) == 2
-    assert all(region.uses_gpu_actor_admission_control() for region in actor_regions)
+    assert all(
+        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        for region in actor_regions
+    )
 
     assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
         {"value": 1},
@@ -399,7 +382,10 @@ def test_plugin_created_gpu_regions_share_one_gpu(monkeypatch, one_gpu_context):
     ]
     assert len(plugin_regions) == 2
     assert all(region._ray_remote_args["num_gpus"] == 1 for region in plugin_regions)
-    assert all(region.uses_gpu_actor_admission_control() for region in plugin_regions)
+    assert all(
+        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        for region in plugin_regions
+    )
 
     assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
         {"value": 1},
@@ -465,7 +451,10 @@ def test_incompatible_plugin_gpu_regions_hand_off_one_gpu(monkeypatch, one_gpu_c
         if isinstance(operator, ExecutableGPUMapBatchesOperator)
     ]
     assert len(plugin_regions) == 2
-    assert all(region.uses_gpu_actor_admission_control() for region in plugin_regions)
+    assert all(
+        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        for region in plugin_regions
+    )
 
     assert sorted(dataset.take_all(), key=lambda row: row["value"]) == [
         {"value": 1},
@@ -531,7 +520,7 @@ def test_plugin_decline_to_stock_gpu_actor_is_admission_safe(
     assert plugin_regions
     assert stock_regions
     assert all(
-        region.uses_gpu_actor_admission_control()
+        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
         for region in (*plugin_regions, *stock_regions)
     )
 

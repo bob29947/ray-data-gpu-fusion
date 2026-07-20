@@ -14,10 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-candidate"
-CANDIDATE_BRANCH = "ray-data-gpu-actor-admission"
-CANDIDATE_SUBJECT = "[Data] Add resource-aware admission for GPU actor pools"
+CANDIDATE_BRANCH = "ray-data-resource-admission"
+CANDIDATE_SUBJECT = "[Data] Add generic resource admission for GPU operators"
 CANDIDATE_PATCH = Path(
-    "ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch"
+    "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch"
 )
 HOOK_PATCHES = (
     Path("ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch"),
@@ -473,8 +473,14 @@ def main() -> int:
 
     from ray.data.context import DataContext
     from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
+    from ray.data._internal.execution.interfaces import PhysicalOperator
+    from ray.data._internal.execution.operators.actor_pool_map_operator import (
+        ActorPoolMapOperator,
+    )
+    from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
+    from ray.data._internal.execution.resource_admission import AdmissionKind
     from ray.data._internal.execution.resource_manager import (
-        GPU_ACTOR_ADMISSION_CONTROL_VERSION,
+        RESOURCE_ADMISSION_CONTROL_VERSION,
     )
 
     if not hasattr(DataContext(), "custom_physical_optimizer_rule_classes"):
@@ -482,12 +488,30 @@ def main() -> int:
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
         raise RuntimeError("Parquet external scan descriptor hook H2 is absent")
     context = DataContext()
-    if GPU_ACTOR_ADMISSION_CONTROL_VERSION != 1:
-        raise RuntimeError("candidate GPU actor admission capability has wrong version")
-    if not isinstance(
-        getattr(context, "_enable_gpu_actor_admission_control", None), bool
+    if RESOURCE_ADMISSION_CONTROL_VERSION != 1:
+        raise RuntimeError("candidate resource admission capability has wrong version")
+    if {kind.value for kind in AdmissionKind} != {
+        "transient",
+        "elastic_pool",
+        "fixed_gang",
+    }:
+        raise RuntimeError("candidate resource admission kinds have changed")
+    for hook in (
+        "resource_admission_spec",
+        "has_internal_admission_demand",
+        "apply_resource_admission_grant",
+        "can_release_resource_admission",
     ):
-        raise RuntimeError("candidate GPU actor admission rollback field is absent")
+        if not callable(getattr(PhysicalOperator, hook, None)):
+            raise RuntimeError(f"candidate lacks PhysicalOperator.{hook}()")
+    if not callable(ActorPoolMapOperator.__dict__.get("resource_admission_spec")):
+        raise RuntimeError("candidate lacks the actor-pool resource admission adapter")
+    if not callable(GPUShuffleOperator.__dict__.get("resource_admission_spec")):
+        raise RuntimeError("candidate lacks the GPU-shuffle gang admission adapter")
+    if not isinstance(
+        getattr(context, "_enable_resource_admission_control", None), bool
+    ):
+        raise RuntimeError("candidate resource admission rollback field is absent")
 
     import ray_data_gpu_fusion as rgf
 
@@ -539,7 +563,7 @@ def main() -> int:
                 "hooked_wheel_sha256": HOOKED_PIN["wheel_sha256"],
                 "plugin": rgf.__version__,
                 "adapter": compatibility.adapter,
-                "gpu_actor_admission_control": GPU_ACTOR_ADMISSION_CONTROL_VERSION,
+                "resource_admission_control": RESOURCE_ADMISSION_CONTROL_VERSION,
                 "runtime": runtime_versions,
             },
             indent=2,

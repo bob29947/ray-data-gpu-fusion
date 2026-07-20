@@ -22,7 +22,7 @@ actions.
 
 - `ray-stock/` is an official Ray submodule pinned to an untouched commit.
 - `ray-pr-candidate/` contains C, the reviewable Ray PR candidate for generic
-  GPU actor admission control.
+  resource admission across GPU actor pools and fixed shuffle gangs.
 - `ray-hooks/` contains exactly two local backend-neutral hooks: H1 adds
   plan-local physical optimizer rules and H2 adds the Parquet scan descriptor.
 - `plugin/` is the independently packaged `ray-data-gpu-fusion` distribution.
@@ -33,6 +33,8 @@ actions.
 
 See [`docs/design.md`](docs/design.md) for the complete proposal,
 [`docs/architecture.md`](docs/architecture.md) for a compact execution summary,
+[`docs/generic-resource-admission.md`](docs/generic-resource-admission.md)
+for the resource-aware GPU actor-pool design,
 and [`docs/phase-0.md`](docs/phase-0.md) for the exact support matrix.
 
 ## Phase 0 scope
@@ -43,9 +45,8 @@ independently executable Ray physical operator before optional fusion.
 
 Within a fused region, intermediate frames remain in cuDF. Between unfused
 regions, the closed-operator contract materializes Arrow-backed Ray blocks, and
-Ray's generic admission control prevents eligible GPU actor pools with
-statically declared per-actor resources from overcommitting the capacity
-reserved for physical operators.
+Ray's generic admission control coordinates eligible GPU actor pools and atomic
+shuffle gangs without overcommitting physical-operator progress floors.
 
 MapGroupPartitions, range partitioning, preprocessors, expressions, shuffles,
 aggregates, and joins are intentionally outside Phase 0.

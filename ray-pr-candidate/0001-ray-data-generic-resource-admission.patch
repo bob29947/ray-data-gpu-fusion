@@ -1,0 +1,4507 @@
+From afa776daadf514a1ba16821c8691088bcc2de78e Mon Sep 17 00:00:00 2001
+From: bob29947 <bob29947@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 23:05:47 +0000
+Subject: [PATCH] [Data] Add generic resource admission for GPU operators
+
+---
+ .../resource-admission-control.md             |  19 +
+ .../default_actor_autoscaler.py               | 100 ++-
+ .../execution/interfaces/physical_operator.py |  30 +
+ .../operators/actor_pool_map_operator.py      | 159 ++++-
+ .../_internal/execution/resource_admission.py |  87 +++
+ .../_internal/execution/resource_manager.py   | 435 +++++++++++-
+ .../_internal/execution/streaming_executor.py |   9 +-
+ .../execution/streaming_executor_state.py     |  51 +-
+ .../_internal/gpu_shuffle/hash_aggregate.py   |  12 +-
+ .../_internal/gpu_shuffle/hash_shuffle.py     | 382 ++++++++---
+ python/ray/data/context.py                    |  10 +
+ .../tests/test_actor_pool_map_operator.py     | 446 +++++++++++-
+ python/ray/data/tests/test_autoscaler.py      | 432 +++++++++++-
+ python/ray/data/tests/test_gpu_aggregate.py   |  12 +-
+ python/ray/data/tests/test_gpu_shuffle.py     | 523 ++++++++++++--
+ python/ray/data/tests/test_map_operator.py    |   8 +-
+ ...st_reservation_based_resource_allocator.py |   8 +
+ .../ray/data/tests/test_resource_manager.py   | 644 ++++++++++++++++++
+ .../ray/data/tests/test_streaming_executor.py |  44 ++
+ 19 files changed, 3156 insertions(+), 255 deletions(-)
+ create mode 100644 doc/source/data/release-notes/resource-admission-control.md
+ create mode 100644 python/ray/data/_internal/execution/resource_admission.py
+
+diff --git a/doc/source/data/release-notes/resource-admission-control.md b/doc/source/data/release-notes/resource-admission-control.md
+new file mode 100644
+index 0000000000..800f08def6
+--- /dev/null
++++ b/doc/source/data/release-notes/resource-admission-control.md
+@@ -0,0 +1,19 @@
++# Ray Data resource admission for GPU actors and shuffle gangs
++
++Ray Data now coordinates complete resource floors for statically declared GPU
++actor pools and GPU shuffle rank gangs. The executor starts resource owners only
++after a topological admission decision, protects one actor or one complete gang
++for each admitted stage, and prevents later stages from leapfrogging the first
++non-fitting frontier. Idle and pending actors are released as stages drain,
++active calls finish without preemption, and shuffle ranks use one atomic
++placement group that is removed after extraction.
++
++Admission safety remains active when proportional operator reservation is
++disabled. Actor-based `map_batches`, actor cuDF `map_groups`, GPU shuffle, and
++GPU hash aggregate are covered. GPU tasks and unknown GPU operators retain
++legacy scheduling and log that deadlock protection does not apply.
++
++Set the internal `DataContext._enable_resource_admission_control` rollback flag
++to `False` to restore legacy acquisition for the declared adapters. The
++internal extension contract is identified by
++`RESOURCE_ADMISSION_CONTROL_VERSION = 1`.
+diff --git a/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py b/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
+index b24bb40c2d..c4ed2f458d 100644
+--- a/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
++++ b/python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py
+@@ -12,7 +12,9 @@ from ray.data.context import WARN_PREFIX, AutoscalingConfig
+ 
+ if TYPE_CHECKING:
+     from ray.data._internal.execution.interfaces import PhysicalOperator
+-    from ray.data._internal.execution.resource_manager import ResourceManager
++    from ray.data._internal.execution.resource_manager import (
++        ResourceManager,
++    )
+     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
+ 
+ logger = logging.getLogger(__name__)
+@@ -34,9 +36,9 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+         self._actor_pool_scaling_down_threshold: float = (
+             config.actor_pool_util_downscaling_threshold
+         )
+-        self._actor_pool_max_upscaling_delta: Optional[
+-            int
+-        ] = config.actor_pool_max_upscaling_delta
++        self._actor_pool_max_upscaling_delta: Optional[int] = (
++            config.actor_pool_max_upscaling_delta
++        )
+ 
+         self._validate_autoscaling_config()
+ 
+@@ -55,30 +57,80 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+         op: "PhysicalOperator",
+         op_state: "OpState",
+     ) -> ActorPoolScalingRequest:
+-        # If all inputs have been consumed, short-circuit
+-        if op.has_completed() or (
+-            op._inputs_complete and op_state.total_enqueued_input_blocks() == 0
++        from ray.data._internal.execution.resource_admission import (
++            ResourceAdmissionState,
++        )
++
++        admission_state = self._resource_manager.get_resource_admission_state(op)
++        uses_admission = isinstance(admission_state, ResourceAdmissionState)
++        min_size = actor_pool.min_size()
++        max_size = actor_pool.max_size()
++        if uses_admission:
++            grant = self._resource_manager.get_resource_admission_grant(op)
++            assert grant is not None
++            actor_limit = grant.max_units
++            if op.metrics.num_inputs_received == 0:
++                min_size = max(min_size, actor_pool.initial_size())
++            min_size = min(min_size, actor_limit)
++            max_size = min(max_size, actor_limit)
++
++        # If all inputs have been consumed, short-circuit. A managed actor op can
++        # still hold its final rebundled input internally after the executor's
++        # external queue is empty; treating that as complete would remove its
++        # actors and prevent a later readmission from ever processing the bundle.
++        if (op.has_execution_finished() if uses_admission else op.has_completed()) or (
++            op._inputs_complete
++            and op_state.total_enqueued_input_blocks() == 0
++            and (not uses_admission or op.internal_input_queue_num_blocks() == 0)
+         ):
+-            num_to_scale_down = self._compute_downscale_delta(actor_pool)
+-            return ActorPoolScalingRequest.downscale(
+-                delta=-num_to_scale_down, force=True, reason="consumed all inputs"
++            num_to_scale_down = (
++                actor_pool.current_size()
++                if uses_admission
++                else self._compute_downscale_delta(actor_pool)
+             )
++            return (
++                ActorPoolScalingRequest.downscale(
++                    delta=-num_to_scale_down,
++                    force=True,
++                    reason="consumed all inputs",
++                )
++                if num_to_scale_down > 0
++                else ActorPoolScalingRequest.no_op(
++                    reason="consumed all inputs and pool is empty"
++                )
++            )
++
++        if (
++            uses_admission
++            and admission_state is not ResourceAdmissionState.ADMITTED
++            and actor_limit == 0
++        ):
++            reason = f"resource admission state is {admission_state.value}"
++            if actor_pool.current_size() > 0:
++                return ActorPoolScalingRequest.downscale(
++                    delta=-actor_pool.current_size(), force=True, reason=reason
++                )
++            return ActorPoolScalingRequest.no_op(reason=reason)
+ 
+-        if actor_pool.current_size() < actor_pool.min_size():
++        if actor_pool.current_size() < min_size:
+             # Scale up, if the actor pool is below min size.
++            delta = min_size - actor_pool.current_size()
++            if uses_admission:
++                delta = min(delta, self._get_actor_pool_max_upscaling_delta())
+             return ActorPoolScalingRequest.upscale(
+-                delta=actor_pool.min_size() - actor_pool.current_size(),
++                delta=delta,
+                 reason="pool below min size",
+             )
+-        elif actor_pool.current_size() > actor_pool.max_size():
++        elif actor_pool.current_size() > max_size:
+             return ActorPoolScalingRequest.downscale(
+-                delta=-(actor_pool.current_size() - actor_pool.max_size()),
++                delta=-(actor_pool.current_size() - max_size),
++                force=uses_admission,
+                 reason="pool exceeding max size",
+             )
+ 
+         allocation = self._resource_manager.get_allocation(op)
+         op_usage = self._resource_manager.get_op_usage(op)
+-        if allocation is not None and op_usage is not None:
++        if not uses_admission and allocation is not None and op_usage is not None:
+             over_budget_scale_down = _get_required_scale_down(
+                 actor_pool, allocation.subtract(op_usage)
+             )
+@@ -107,14 +159,17 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+             # Do not scale up if either
+             #   - Actor Pool is at max size already
+             #   - Op is throttled (ie exceeding allocated resource quota)
+-            if actor_pool.current_size() >= actor_pool.max_size():
++            if actor_pool.current_size() >= max_size:
+                 return ActorPoolScalingRequest.no_op(reason="reached max size")
+-            if not op_state._scheduling_status.under_resource_limits:
++            if (
++                not uses_admission
++                and not op_state._scheduling_status.under_resource_limits
++            ):
+                 return ActorPoolScalingRequest.no_op(
+                     reason="operator exceeding resource quota"
+                 )
+ 
+-            budget = self._resource_manager.get_budget(op)
++            budget = None if uses_admission else self._resource_manager.get_budget(op)
+             budget_max_scale_up = (
+                 _get_max_scale_up(actor_pool, budget) if budget else sys.maxsize
+             )
+@@ -126,7 +181,7 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+             max_scale_up: int = min(
+                 budget_max_scale_up,
+                 self._get_actor_pool_max_upscaling_delta(),
+-                actor_pool.max_size() - actor_pool.current_size(),
++                max_size - actor_pool.current_size(),
+             )
+ 
+             if max_scale_up == 0:
+@@ -146,8 +201,7 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+             return ActorPoolScalingRequest.upscale(
+                 delta=delta,
+                 reason=(
+-                    f"utilization of {util} >= "
+-                    f"{self._actor_pool_scaling_up_threshold}"
++                    f"utilization of {util} >= {self._actor_pool_scaling_up_threshold}"
+                 ),
+             )
+         elif util <= self._actor_pool_scaling_down_threshold:
+@@ -155,10 +209,10 @@ class DefaultActorAutoscaler(ActorAutoscaler):
+                 return ActorPoolScalingRequest.no_op(
+                     reason="no downscaling while actors are pending"
+                 )
+-            if actor_pool.current_size() <= actor_pool.min_size():
++            if actor_pool.current_size() <= min_size:
+                 return ActorPoolScalingRequest.no_op(reason="reached min size")
+ 
+-            max_can_release = actor_pool.current_size() - actor_pool.min_size()
++            max_can_release = actor_pool.current_size() - min_size
+             num_to_scale_down = min(
+                 self._compute_downscale_delta(actor_pool), max_can_release
+             )
+diff --git a/python/ray/data/_internal/execution/interfaces/physical_operator.py b/python/ray/data/_internal/execution/interfaces/physical_operator.py
+index 4fb8a69e59..20bf33bc2c 100644
+--- a/python/ray/data/_internal/execution/interfaces/physical_operator.py
++++ b/python/ray/data/_internal/execution/interfaces/physical_operator.py
+@@ -29,6 +29,10 @@ from ray.data._internal.execution.interfaces.execution_options import (
+     ExecutionOptions,
+     ExecutionResources,
+ )
++from ray.data._internal.execution.resource_admission import (
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++)
+ from ray.data._internal.execution.interfaces.op_runtime_metrics import OpRuntimeMetrics
+ from ray.data._internal.logical.interfaces import LogicalOperator, Operator
+ from ray.data._internal.output_buffer import OutputBlockSizeOption
+@@ -992,6 +996,32 @@ class PhysicalOperator(Operator):
+         """
+         return ExecutionResources.zero(), ExecutionResources.inf()
+ 
++    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
++        """Return the resource floor and lifecycle managed by the executor.
++
++        Operators that acquire scarce resources across multiple inputs should
++        override this together with the other resource-admission hooks.
++        """
++        return None
++
++    def _resource_admission_fallback_reason(self) -> Optional[str]:
++        """Explain why this operator cannot declare a static admission bundle."""
++        return None
++
++    def has_internal_admission_demand(self) -> bool:
++        """Whether internal work or owned resources require an admission grant."""
++        return False
++
++    def apply_resource_admission_grant(
++        self, grant: ResourceAdmissionGrant
++    ) -> None:
++        """Apply the maximum number of resource units the operator may own."""
++        pass
++
++    def can_release_resource_admission(self) -> bool:
++        """Whether a sticky grant can be revoked without interrupting progress."""
++        return True
++
+     def incremental_resource_usage(self) -> ExecutionResources:
+         """Returns the incremental resources required for processing another input.
+ 
+diff --git a/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py b/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
+index 76afc11e4e..4ffe9e8134 100644
+--- a/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
++++ b/python/ray/data/_internal/execution/operators/actor_pool_map_operator.py
+@@ -26,6 +26,7 @@ if TYPE_CHECKING:
+ 
+     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
+ import ray
++from ray._common.utils import resources_from_ray_options
+ from ray.actor import ActorHandle
+ from ray.core.generated import gcs_pb2
+ from ray.data._internal.actor_autoscaler import (
+@@ -60,6 +61,12 @@ from ray.data._internal.execution.operators.map_operator import (
+     _map_task,
+ )
+ from ray.data._internal.execution.operators.map_transformer import MapTransformer
++from ray.data._internal.execution.resource_admission import (
++    AdmissionBundle,
++    AdmissionKind,
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++)
+ from ray.data._internal.execution.util import locality_string, merge_label_selector
+ from ray.data._internal.remote_fn import _add_system_error_to_retry_exceptions
+ from ray.data._internal.utils.heapdict import heapdict
+@@ -170,6 +177,13 @@ class ActorPoolMapOperator(MapOperator):
+         )
+ 
+         self._min_rows_per_bundle = min_rows_per_bundle
++        # Preserve whether dynamic actor options came from the user. Physical
++        # optimizer rules may later wrap ``_ray_remote_args_fn`` to add Ray's
++        # own memory estimate; that internal wrapper does not make otherwise
++        # static CPU/GPU declarations ineligible for admission control. The
++        # first progress actor starts before output-derived memory is available;
++        # later memory-bearing actors are optional scale-out units.
++        self._uses_user_provided_remote_args_fn = ray_remote_args_fn is not None
+         self._ray_remote_args_fn = ray_remote_args_fn
+         self._ray_remote_args = self._apply_default_remote_args(
+             self._ray_remote_args, self.data_context
+@@ -187,6 +201,8 @@ class ActorPoolMapOperator(MapOperator):
+         self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
+ 
+         self._actor_pool = self._create_actor_pool(compute_strategy)
++        self._admission_grant: Optional[ResourceAdmissionGrant] = None
++        self._min_actors_wait_start_time: Optional[float] = None
+         # A queue of bundles awaiting dispatch to actors.
+         self._bundle_queue = create_bundle_queue()
+         # Cached actor class.
+@@ -276,17 +292,22 @@ class ActorPoolMapOperator(MapOperator):
+         super().start(options, block_ref_counter)
+ 
+         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
+-        self._actor_pool.scale(
+-            ActorPoolScalingRequest(
+-                delta=self._actor_pool.initial_size(), reason="scaling to initial size"
++        if self._admission_grant is None:
++            self._actor_pool.scale(
++                ActorPoolScalingRequest(
++                    delta=self._actor_pool.initial_size(),
++                    reason="scaling to initial size",
++                )
+             )
+-        )
+ 
+         # If `wait_for_min_actors_s` is specified and is positive, then
+         # Actor Pool will block until min number of actors is provisioned.
+         #
+         # Otherwise, all actors will be provisioned asynchronously.
+-        if self.data_context.wait_for_min_actors_s > 0:
++        if (
++            self._admission_grant is None
++            and self.data_context.wait_for_min_actors_s > 0
++        ):
+             refs = self._actor_pool.get_pending_actor_refs()
+ 
+             logger.debug(
+@@ -304,6 +325,108 @@ class ActorPoolMapOperator(MapOperator):
+                     "enough resources for the requested actor pool."
+                 )
+ 
++    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
++        per_actor = self._actor_pool.per_actor_resource_usage()
++        if (
++            not self.data_context._enable_resource_admission_control
++            or self._resource_admission_fallback_reason() is not None
++            or per_actor.gpu <= 0
++        ):
++            return None
++
++        remote_args = merge_label_selector(
++            self._ray_remote_args,
++            self.data_context.execution_options.label_selector,
++        )
++        bundle = AdmissionBundle(
++            resources=per_actor,
++            custom_resources=tuple(
++                sorted(
++                    (name, value)
++                    for name, value in resources_from_ray_options(remote_args).items()
++                    if name not in {"CPU", "GPU", "memory", "object_store_memory"}
++                )
++            ),
++            label_selector=tuple(
++                sorted((remote_args.get("label_selector") or {}).items())
++            ),
++        )
++        max_size = self._actor_pool.max_size()
++        return ResourceAdmissionSpec(
++            kind=AdmissionKind.ELASTIC_POOL,
++            minimum_bundles=(bundle,),
++            unit_bundle=bundle,
++            max_units=None if max_size == float("inf") else int(max_size),
++            sticky_after_start=False,
++        )
++
++    def _resource_admission_fallback_reason(self) -> Optional[str]:
++        if self._uses_user_provided_remote_args_fn:
++            return (
++                "a user-provided ray_remote_args_fn has no declared static "
++                "resource envelope"
++            )
++        if self._actor_pool.per_actor_resource_usage().gpu <= 0:
++            return None
++        scheduling_strategy = self._ray_remote_args.get("scheduling_strategy")
++        if scheduling_strategy not in (None, "DEFAULT", "SPREAD"):
++            return (
++                f"{type(scheduling_strategy).__name__} scheduling_strategy cannot "
++                "be represented by resource admission"
++            )
++        return None
++
++    def has_internal_admission_demand(self) -> bool:
++        return self.internal_input_queue_num_blocks() > 0
++
++    def apply_resource_admission_grant(self, grant: ResourceAdmissionGrant) -> None:
++        previous_max_actors = self._admitted_actor_limit() or 0
++        self._admission_grant = grant
++        if grant.max_units <= 0:
++            self._min_actors_wait_start_time = None
++        elif previous_max_actors <= 0 and self.data_context.wait_for_min_actors_s > 0:
++            self._min_actors_wait_start_time = time.monotonic()
++
++    def can_release_resource_admission(self) -> bool:
++        return self._actor_pool.num_active_actors() == 0
++
++    def _admitted_actor_limit(self) -> Optional[int]:
++        return None if self._admission_grant is None else self._admission_grant.max_units
++
++    def _poll_min_actors_ready(self) -> bool:
++        actor_limit = self._admitted_actor_limit()
++        if (
++            actor_limit is None
++            or actor_limit <= 0
++            or self.data_context.wait_for_min_actors_s <= 0
++        ):
++            return True
++        required = min(self._actor_pool.min_size(), actor_limit)
++        if self._actor_pool.num_running_actors() >= required:
++            self._min_actors_wait_start_time = None
++            return True
++        if self._min_actors_wait_start_time is None:
++            self._min_actors_wait_start_time = time.monotonic()
++        if (
++            time.monotonic() - self._min_actors_wait_start_time
++            >= self.data_context.wait_for_min_actors_s
++        ):
++            raise ray.exceptions.GetTimeoutError(
++                "Timed out while starting actors. This may mean that the cluster "
++                "does not have enough resources for the requested actor pool."
++            )
++        return False
++
++    def _admission_allows_scheduling(self) -> bool:
++        actor_limit = self._admitted_actor_limit()
++        if actor_limit is None:
++            return True
++        return (
++            actor_limit > 0
++            and self._actor_pool.current_size() <= actor_limit
++            and self._poll_min_actors_ready()
++        )
++
+     def can_add_input(self) -> bool:
+         """NOTE: PLEASE READ CAREFULLY
+ 
+@@ -315,7 +438,9 @@ class ActorPoolMapOperator(MapOperator):
+             should be able to launch a task.
+ 
+         """
+-        return self._actor_pool.can_schedule_task()
++        return (
++            self._admission_allows_scheduling() and self._actor_pool.can_schedule_task()
++        )
+ 
+     def _start_actor(
+         self, labels: Dict[str, str], logical_actor_id: LogicalActorId
+@@ -384,16 +509,18 @@ class ActorPoolMapOperator(MapOperator):
+         submitted = self._try_schedule_tasks_internal()
+ 
+         if strict:
+-            assert (
+-                submitted >= 1
+-            ), f"Expected at least 1 task launched (launched {submitted})"
++            assert submitted >= 1, (
++                f"Expected at least 1 task launched (launched {submitted})"
++            )
+ 
+     def _try_schedule_tasks_internal(self) -> int:
+         """Try to dispatch tasks from the internal queue. Returns the # of tasks submitted"""
+ 
++        if not self._admission_allows_scheduling():
++            return 0
++
+         num_submitted_tasks = 0
+         while self._bundle_queue.has_next():
+-
+             bundle = self._bundle_queue.peek_next()
+             actor = self._actor_pool.select_actors(
+                 bundle=bundle,
+@@ -517,6 +644,10 @@ class ActorPoolMapOperator(MapOperator):
+         self,
+     ) -> Tuple[ExecutionResources, ExecutionResources]:
+         min_actors = self._actor_pool.min_size()
++        # Admission-controlled pools can make progress with one actor even when
++        # the cluster cannot place the configured minimum pool size at once.
++        if self._admission_grant is not None:
++            min_actors = 1
+         max_actors = self._actor_pool.max_size()
+         assert min_actors is not None, min_actors
+ 
+@@ -575,6 +706,14 @@ class ActorPoolMapOperator(MapOperator):
+     ) -> Dict[str, Any]:
+         """Apply defaults to the actor creation remote args."""
+         ray_remote_args = ray_remote_args.copy()
++        if (
++            "num_cpus" not in ray_remote_args
++            and (ray_remote_args.get("num_gpus") or 0) > 0
++        ):
++            # Ray Core defaults GPU actors to one lifetime CPU.
++            # Materialize that default so admission and pool accounting use the
++            # same complete bundle that Core schedules.
++            ray_remote_args["num_cpus"] = 1
+         if "scheduling_strategy" not in ray_remote_args:
+             ray_remote_args["scheduling_strategy"] = data_context.scheduling_strategy
+         # Enable actor fault tolerance by default, with infinite actor recreations and
+diff --git a/python/ray/data/_internal/execution/resource_admission.py b/python/ray/data/_internal/execution/resource_admission.py
+new file mode 100644
+index 0000000000..d2ace61ef9
+--- /dev/null
++++ b/python/ray/data/_internal/execution/resource_admission.py
+@@ -0,0 +1,87 @@
++from __future__ import annotations
++
++import enum
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Optional, Tuple
++
++if TYPE_CHECKING:
++    from ray.data._internal.execution.interfaces.execution_options import (
++        ExecutionResources,
++    )
++
++
++RESOURCE_ADMISSION_CONTROL_VERSION = 1
++
++
++class AdmissionKind(enum.Enum):
++    TRANSIENT = "transient"
++    ELASTIC_POOL = "elastic_pool"
++    FIXED_GANG = "fixed_gang"
++
++
++class ResourceAdmissionState(enum.Enum):
++    DORMANT = "dormant"
++    ADMITTED = "admitted"
++    FRONTIER = "frontier"
++    BLOCKED = "blocked"
++
++
++@dataclass(frozen=True)
++class AdmissionBundle:
++    resources: ExecutionResources
++    custom_resources: Tuple[Tuple[str, float], ...] = ()
++    label_selector: Tuple[Tuple[str, str], ...] = ()
++
++
++@dataclass(frozen=True)
++class ResourceAdmissionSpec:
++    kind: AdmissionKind
++    minimum_bundles: Tuple[AdmissionBundle, ...]
++    unit_bundle: Optional[AdmissionBundle]
++    max_units: Optional[int]
++    sticky_after_start: bool
++
++
++@dataclass(frozen=True)
++class ResourceAdmissionGrant:
++    max_units: int
++
++
++def aggregate_minimum_resources(
++    spec: ResourceAdmissionSpec,
++) -> ExecutionResources:
++    from ray.data._internal.execution.interfaces.execution_options import (
++        ExecutionResources,
++    )
++
++    return ExecutionResources.combine_sum(
++        bundle.resources for bundle in spec.minimum_bundles
++    )
++
++
++def validate_resource_admission_spec(spec: ResourceAdmissionSpec) -> None:
++    if not spec.minimum_bundles:
++        raise ValueError("Resource admission requires at least one minimum bundle")
++    if spec.max_units is not None and spec.max_units <= 0:
++        raise ValueError("Resource admission max_units must be positive")
++    if spec.kind is not AdmissionKind.FIXED_GANG and spec.unit_bundle is None:
++        raise ValueError(f"{spec.kind.value} resource admission requires a unit bundle")
++
++    bundles = list(spec.minimum_bundles)
++    if spec.unit_bundle is not None:
++        bundles.append(spec.unit_bundle)
++    for bundle in bundles:
++        if not bundle.resources.is_non_negative():
++            raise ValueError("Resource admission bundles must be non-negative")
++        if any(value < 0 for _, value in bundle.custom_resources):
++            raise ValueError(
++                "Custom resources in admission bundles must be non-negative"
++            )
++
++    minimum_units = (
++        1 if spec.kind is AdmissionKind.FIXED_GANG else len(spec.minimum_bundles)
++    )
++    if spec.max_units is not None and spec.max_units < minimum_units:
++        raise ValueError(
++            "Resource admission max_units cannot be smaller than the minimum floor"
++        )
+diff --git a/python/ray/data/_internal/execution/resource_manager.py b/python/ray/data/_internal/execution/resource_manager.py
+index aba473be19..bc63e0910b 100644
+--- a/python/ray/data/_internal/execution/resource_manager.py
++++ b/python/ray/data/_internal/execution/resource_manager.py
+@@ -16,6 +16,15 @@ from ray.data._internal.execution.interfaces.physical_operator import (
+     PhysicalOperator,
+     ReportsExtraResourceUsage,
+ )
++from ray.data._internal.execution.resource_admission import (
++    RESOURCE_ADMISSION_CONTROL_VERSION as RESOURCE_ADMISSION_CONTROL_VERSION,
++    AdmissionKind,
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++    ResourceAdmissionState,
++    aggregate_minimum_resources,
++    validate_resource_admission_spec,
++)
+ from ray.data._internal.execution.operators.base_physical_operator import (
+     AllToAllOperator,
+ )
+@@ -37,7 +46,6 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
+-
+ LOG_DEBUG_TELEMETRY_FOR_RESOURCE_MANAGER_OVERRIDE: Optional[bool] = env_bool(
+     "RAY_DATA_DEBUG_RESOURCE_MANAGER", None
+ )
+@@ -144,9 +152,12 @@ class ResourceManager:
+ 
+         self._block_ref_counter = block_ref_counter
+ 
+-        self._op_resource_allocator: Optional[
+-            "OpResourceAllocator"
+-        ] = create_resource_allocator(self, data_context)
++        self._op_resource_allocator: Optional["OpResourceAllocator"] = (
++            create_resource_allocator(self, data_context)
++        )
++        self._resource_admission_controller = _ResourceAdmissionController(
++            topology, self
++        )
+ 
+         self._object_store_memory_limit_fraction = (
+             data_context.override_object_store_memory_limit_fraction
+@@ -165,9 +176,9 @@ class ResourceManager:
+ 
+     def set_external_consumer_bytes(self, num_bytes: int) -> None:
+         """Set the bytes buffered by external consumers."""
+-        assert (
+-            num_bytes >= 0
+-        ), f"external consumer bytes must be non-negative, got {num_bytes}"
++        assert num_bytes >= 0, (
++            f"external consumer bytes must be non-negative, got {num_bytes}"
++        )
+         self._external_consumer_bytes = num_bytes
+         self._has_external_consumer = True
+ 
+@@ -246,25 +257,36 @@ class ResourceManager:
+             self._op_pending_usages.values()
+         )
+ 
+-        if self._op_resource_allocator is not None:
+-            self._update_allocated_budgets()
++        if (
++            self._op_resource_allocator is not None
++            or self._resource_admission_controller.has_participants()
++        ):
++            available_limits = self._get_available_limits_for_allocation()
++            self._resource_admission_controller.update_states(available_limits)
++            if self._op_resource_allocator is not None:
++                self._update_allocated_budgets(available_limits)
++            self._resource_admission_controller.update_grants()
+ 
+-    def _update_allocated_budgets(self):
++    def _get_available_limits_for_allocation(self) -> ExecutionResources:
+         completed_ops_usage = self._get_completed_ops_usage()
+-
+-        available_limits = (
++        return (
+             self.get_global_limits()
+             .subtract(completed_ops_usage)
+             .max(ExecutionResources.zero())
+         )
+ 
++    def _update_allocated_budgets(
++        self, available_limits: Optional[ExecutionResources] = None
++    ):
++        if available_limits is None:
++            available_limits = self._get_available_limits_for_allocation()
+         self._op_resource_allocator.update_budgets(limits=available_limits)
+ 
+     def get_global_usage(self) -> ExecutionResources:
+         """Return the global resource usage at the current time."""
+-        assert (
+-            self._global_usage.is_non_negative()
+-        ), f"Global usage should be non-negative, got {self._global_usage}"
++        assert self._global_usage.is_non_negative(), (
++            f"Global usage should be non-negative, got {self._global_usage}"
++        )
+         return self._global_usage
+ 
+     def get_global_running_usage(self) -> ExecutionResources:
+@@ -376,8 +398,7 @@ class ResourceManager:
+             # vs. the operator's own output queues.
+             if op is self._output_operator and self._has_external_consumer:
+                 usage_str += (
+-                    f",external_consumer="
+-                    f"{memory_string(self._external_consumer_bytes)}"
++                    f",external_consumer={memory_string(self._external_consumer_bytes)}"
+                 )
+             usage_str += ")"
+             if self._op_resource_allocator is not None:
+@@ -410,6 +431,24 @@ class ResourceManager:
+         """Return whether OpResourceAllocator is enabled."""
+         return self._op_resource_allocator is not None
+ 
++    def get_resource_admission_state(
++        self, op: PhysicalOperator
++    ) -> Optional[ResourceAdmissionState]:
++        """Return the managed admission state, or ``None`` for legacy operators."""
++        return self._resource_admission_controller.get_state(op)
++
++    def get_resource_admission_grant(
++        self, op: PhysicalOperator
++    ) -> Optional[ResourceAdmissionGrant]:
++        """Return the latest executor-owned grant for an admitted operator."""
++        return self._resource_admission_controller.get_grant(op)
++
++    def get_resource_admission_minimum_resources(
++        self, op: PhysicalOperator
++    ) -> Optional[ExecutionResources]:
++        """Return an admitted operator's aggregate minimum resource floor."""
++        return self._resource_admission_controller.get_minimum_resources(op)
++
+     @property
+     def op_resource_allocator(self) -> "OpResourceAllocator":
+         """Return the OpResourceAllocator."""
+@@ -430,6 +469,14 @@ class ResourceManager:
+             return None
+         return self._op_resource_allocator.get_allocation(op)
+ 
++    def get_allocation_target(
++        self, op: PhysicalOperator
++    ) -> Optional[ExecutionResources]:
++        """Return the usage-independent allocation target for an operator."""
++        if self._op_resource_allocator is None:
++            return None
++        return self._op_resource_allocator.get_allocation_target(op)
++
+     def is_op_eligible(self, op: PhysicalOperator) -> bool:
+         """Whether the op is eligible for memory reservation."""
+         return (
+@@ -537,6 +584,265 @@ class ResourceManager:
+         )
+ 
+ 
++class _ResourceAdmissionController:
++    """Admit physical operators through their generic resource contracts."""
++
++    def __init__(self, topology: "Topology", resource_manager: ResourceManager):
++        self._topology = topology
++        self._resource_manager = resource_manager
++        self._specs: Dict[PhysicalOperator, ResourceAdmissionSpec] = {}
++        gpu_admission_fallbacks = []
++        for op in topology:
++            spec = op.resource_admission_spec()
++            if spec is not None:
++                if not isinstance(spec, ResourceAdmissionSpec):
++                    raise TypeError(
++                        f"{op} returned an invalid resource admission specification: "
++                        f"{type(spec).__name__}"
++                    )
++                validate_resource_admission_spec(spec)
++                self._validate_explicit_resource_limits(op, spec)
++                self._specs[op] = spec
++            else:
++                fallback_reason = op._resource_admission_fallback_reason()
++                if op.min_scheduling_resources().gpu > 0 or fallback_reason is not None:
++                    gpu_admission_fallbacks.append((op, fallback_reason))
++
++        if gpu_admission_fallbacks:
++            op_descriptions = ", ".join(
++                f"{op} ({reason})" if reason is not None else str(op)
++                for op, reason in gpu_admission_fallbacks
++            )
++            logger.warning(
++                "GPU resource admission is not implemented for operator(s) %s; "
++                "resource deadlock protection does not apply to them.",
++                op_descriptions,
++            )
++
++        self._states: Dict[PhysicalOperator, ResourceAdmissionState] = dict.fromkeys(
++            self._specs, ResourceAdmissionState.DORMANT
++        )
++        self._grants: Dict[PhysicalOperator, ResourceAdmissionGrant] = {}
++        self._autoscaling_frontier_op: Optional[PhysicalOperator] = None
++        for op in self._specs:
++            self._set_grant(op, 0)
++
++    def _validate_explicit_resource_limits(
++        self, op: PhysicalOperator, spec: ResourceAdmissionSpec
++    ) -> None:
++        options = self._resource_manager._options
++        permitted = options.resource_limits.subtract(options.exclude_resources).max(
++            ExecutionResources.zero()
++        )
++        required = aggregate_minimum_resources(spec)
++        if not required.satisfies_limit(permitted, ignore_object_store_memory=True):
++            raise ValueError(
++                f"{op} requires an admission floor of {len(spec.minimum_bundles)} "
++                f"bundle(s) totaling {required}, which exceeds the explicit effective "
++                f"execution resource limits {permitted}."
++            )
++
++    @staticmethod
++    def _requires_conservative_isolation(spec: ResourceAdmissionSpec) -> bool:
++        """Whether bundle placement cannot be represented by aggregate limits.
++
++        Custom resources and node labels are per-node constraints. The Data
++        executor's aggregate ``ExecutionResources`` has no node-shape model, so
++        serialize all admission claimants while such a bundle participates. This
++        is conservative, but prevents an unconstrained owner from taking the only
++        node on which the constrained owner can make progress.
++        """
++        return any(
++            bundle is not None and (bundle.custom_resources or bundle.label_selector)
++            for bundle in (*spec.minimum_bundles, spec.unit_bundle)
++        )
++
++    @staticmethod
++    def _is_admission_complete(op: PhysicalOperator, op_state: "OpState") -> bool:
++        return (
++            (op.has_execution_finished() or op._inputs_complete)
++            and op_state.total_enqueued_input_blocks() == 0
++            and not op.has_internal_admission_demand()
++            and op.num_active_tasks() == 0
++            and op.can_release_resource_admission()
++        )
++
++    def get_state(self, op: PhysicalOperator) -> Optional[ResourceAdmissionState]:
++        return self._states.get(op)
++
++    def has_participants(self) -> bool:
++        return bool(self._specs)
++
++    def get_grant(self, op: PhysicalOperator) -> Optional[ResourceAdmissionGrant]:
++        return self._grants.get(op)
++
++    def get_minimum_resources(
++        self, op: PhysicalOperator
++    ) -> Optional[ExecutionResources]:
++        spec = self._specs.get(op)
++        return None if spec is None else aggregate_minimum_resources(spec)
++
++    @staticmethod
++    def _minimum_units(spec: ResourceAdmissionSpec) -> int:
++        return 1 if spec.kind is AdmissionKind.FIXED_GANG else len(spec.minimum_bundles)
++
++    def _set_grant(self, op: PhysicalOperator, max_units: int) -> None:
++        spec = self._specs[op]
++        if spec.max_units is not None:
++            max_units = min(max_units, spec.max_units)
++        grant = ResourceAdmissionGrant(max_units=max(0, max_units))
++        current_grant = self._grants.get(op)
++        if (
++            grant.max_units == 0
++            and current_grant is not None
++            and current_grant.max_units > 0
++            and spec.sticky_after_start
++            and not op.can_release_resource_admission()
++        ):
++            return
++        if current_grant == grant:
++            return
++        self._grants[op] = grant
++        op.apply_resource_admission_grant(grant)
++
++    def update_states(self, limits: Optional[ExecutionResources] = None) -> None:
++        """Recompute admitted, frontier, blocked, and dormant participants."""
++        if not self._specs:
++            return
++
++        unfinished = {
++            op
++            for op in self._specs
++            if not self._is_admission_complete(op, self._topology[op])
++        }
++        claimants = set()
++        for op in self._specs:
++            if op not in unfinished:
++                continue
++            op_state = self._topology[op]
++            owns_resources = (
++                not op.current_logical_usage().is_zero()
++                or not op.pending_logical_usage().is_zero()
++            )
++            if (
++                op_state.total_enqueued_input_blocks() > 0
++                or op.has_internal_admission_demand()
++                or op.num_active_tasks() > 0
++                or not op.can_release_resource_admission()
++                or (owns_resources and not op._inputs_complete)
++            ):
++                claimants.add(op)
++
++        stack = [dep for op in claimants for dep in op.input_dependencies]
++        visited = set()
++        while stack:
++            ancestor = stack.pop()
++            if ancestor in visited:
++                continue
++            visited.add(ancestor)
++            if ancestor in self._specs and ancestor in unfinished:
++                claimants.add(ancestor)
++            stack.extend(ancestor.input_dependencies)
++
++        remaining = (
++            limits if limits is not None else self._resource_manager.get_global_limits()
++        )
++        current_capacity = remaining
++        self._autoscaling_frontier_op = None
++        requires_isolation = any(
++            self._requires_conservative_isolation(self._specs[op]) for op in claimants
++        )
++        sticky_ops = {
++            op
++            for op in claimants
++            if self._states[op] is ResourceAdmissionState.ADMITTED
++            and self._specs[op].sticky_after_start
++            and not op.can_release_resource_admission()
++        }
++        protected_ops = set(sticky_ops)
++        stack = [dep for op in sticky_ops for dep in op.input_dependencies]
++        while stack:
++            ancestor = stack.pop()
++            if ancestor in protected_ops:
++                continue
++            if ancestor in self._specs and ancestor in unfinished:
++                protected_ops.add(ancestor)
++            stack.extend(ancestor.input_dependencies)
++
++        for op in protected_ops:
++            remaining = remaining.subtract(
++                aggregate_minimum_resources(self._specs[op])
++            ).max(ExecutionResources.zero())
++
++        has_frontier = False
++        has_admitted_claimant = bool(protected_ops)
++        for op in self._specs:
++            if op not in claimants:
++                self._states[op] = ResourceAdmissionState.DORMANT
++                continue
++            if op in protected_ops:
++                self._states[op] = ResourceAdmissionState.ADMITTED
++                continue
++            if has_frontier:
++                self._states[op] = ResourceAdmissionState.BLOCKED
++                continue
++
++            minimum_resources = aggregate_minimum_resources(self._specs[op])
++            fits_resources = minimum_resources.satisfies_limit(
++                remaining, ignore_object_store_memory=True
++            )
++            fits_isolation = not requires_isolation or not has_admitted_claimant
++            if fits_resources and fits_isolation:
++                self._states[op] = ResourceAdmissionState.ADMITTED
++                remaining = remaining.subtract(minimum_resources).max(
++                    ExecutionResources.zero()
++                )
++                has_admitted_claimant = True
++            else:
++                self._states[op] = ResourceAdmissionState.FRONTIER
++                if (
++                    not fits_resources
++                    and op.can_release_resource_admission()
++                    and not minimum_resources.satisfies_limit(
++                        current_capacity, ignore_object_store_memory=True
++                    )
++                ):
++                    self._autoscaling_frontier_op = op
++                has_frontier = True
++
++    @staticmethod
++    def _max_units_for_target(
++        target: ExecutionResources, spec: ResourceAdmissionSpec
++    ) -> int:
++        if spec.kind is AdmissionKind.FIXED_GANG:
++            return 1
++        assert spec.unit_bundle is not None
++        resources = spec.unit_bundle.resources
++        if resources.cpu == resources.gpu == resources.memory == 0:
++            return 0
++        units = target.floordiv(resources)
++        return int(min(units.cpu, units.gpu, units.memory))
++
++    def update_grants(self) -> None:
++        """Propagate usage-independent allocation caps through generic grants."""
++        for op in self._specs:
++            spec = self._specs[op]
++            if op is self._autoscaling_frontier_op:
++                self._set_grant(op, self._minimum_units(spec))
++                continue
++            if self._states[op] is not ResourceAdmissionState.ADMITTED:
++                self._set_grant(op, 0)
++                continue
++            minimum_units = self._minimum_units(spec)
++            target = self._resource_manager.get_allocation_target(op)
++            target_units = (
++                minimum_units
++                if target is None
++                else max(minimum_units, self._max_units_for_target(target, spec))
++            )
++            self._set_grant(op, target_units)
++
++
+ def _get_first_pending_materializing_op(topology: "Topology") -> int:
+     for idx, op in enumerate(topology):
+         if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS) and not op.has_completed():
+@@ -599,6 +905,12 @@ class OpResourceAllocator(ABC):
+         allocation is unlimited."""
+         ...
+ 
++    def get_allocation_target(
++        self, op: PhysicalOperator
++    ) -> Optional[ExecutionResources]:
++        """Return reserved plus assigned shared resources, independent of usage."""
++        return None
++
+     def _get_eligible_ops(self) -> List[PhysicalOperator]:
+         """Returns a list of operators eligible for allocation.
+ 
+@@ -614,6 +926,8 @@ class OpResourceAllocator(ABC):
+             op
+             for idx, op in enumerate(self._topology)
+             if self._is_op_eligible(op)
++            and self._resource_manager.get_resource_admission_state(op)
++            in (None, ResourceAdmissionState.ADMITTED)
+             and (
+                 first_pending_materializing_op_idx == -1
+                 or idx <= first_pending_materializing_op_idx
+@@ -677,6 +991,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+         self._total_shared = ExecutionResources.zero()
+         # Resource budgets for each operator, excluding `_reserved_for_op_outputs`.
+         self._op_budgets: Dict[PhysicalOperator, ExecutionResources] = {}
++        self._allocation_targets: Dict[PhysicalOperator, ExecutionResources] = {}
+         # Remaining memory budget for generating new task outputs, per operator.
+         self._output_budgets: Dict[PhysicalOperator, float] = {}
+         # Whether each operator has reserved the minimum resources to run
+@@ -695,16 +1010,29 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+         self._op_reserved.clear()
+         self._reserved_for_op_outputs.clear()
+         self._reserved_min_resources.clear()
++        self._allocation_targets.clear()
+ 
+         if len(eligible_ops) == 0:
+             return
+ 
+         remaining = limits.copy()
+ 
+-        # Reserve `reservation_ratio * global_limits / num_ops` resources for each
+-        # operator.
+-        default_reserved = limits.scale(self._reservation_ratio / (len(eligible_ops)))
++        # Protect each admitted operator's complete progress floor before
++        # default reservation or shared-resource distribution.
++        admission_floors: Dict[PhysicalOperator, ExecutionResources] = {}
++        for op in eligible_ops:
++            floor = self._resource_manager.get_resource_admission_minimum_resources(op)
++            if floor is not None:
++                admission_floors[op] = floor
++                remaining = remaining.subtract(floor).max(ExecutionResources.zero())
++
++        # Distribute the configured default reservation from resources remaining
++        # after protected admission floors.
++        default_reserved = remaining.scale(
++            self._reservation_ratio / (len(eligible_ops))
++        )
+         for index, op in enumerate(eligible_ops):
++            admission_floor = admission_floors.get(op, ExecutionResources.zero())
+             # Reserve at least half of the default reserved resources for the outputs.
+             # This makes sure that we will have enough budget to pull blocks from the
+             # op.
+@@ -712,7 +1040,9 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+                 0, 0, max(default_reserved.object_store_memory / 2, 1)
+             )
+ 
+-            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs)
++            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs).add(
++                admission_floor
++            )
+ 
+             min_resource_usage, max_resource_usage = op.min_max_resource_requirements()
+ 
+@@ -725,7 +1055,10 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+             # and reserved_for_outputs. Note, we only consider CPU and GPU, but not
+             # object_store_memory, because object_store_memory can be oversubscribed,
+             # but CPU/GPU cannot.
+-            if reserved_for_tasks.add(reserved_for_outputs).satisfies_limit(
++            additional_task_reservation = reserved_for_tasks.subtract(
++                admission_floor
++            ).max(ExecutionResources.zero())
++            if additional_task_reservation.add(reserved_for_outputs).satisfies_limit(
+                 remaining, ignore_object_store_memory=True
+             ):
+                 self._reserved_min_resources[op] = True
+@@ -742,8 +1075,8 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+                 # NOTE: we prioritize upstream operators for minimum resource reservation.
+                 # ops. It's fine that downstream ops don't get the minimum reservation,
+                 # because they can wait for upstream ops to finish and release resources.
+-                reserved_for_tasks = ExecutionResources(
+-                    0, 0, min_resource_usage.object_store_memory
++                reserved_for_tasks = admission_floor.copy(
++                    object_store_memory=min_resource_usage.object_store_memory
+                 )
+ 
+             # Log a warning if even the first operator cannot reserve the minimum
+@@ -754,11 +1087,46 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+             self._op_reserved[op] = reserved_for_tasks
+             self._reserved_for_op_outputs[op] = reserved_for_outputs.object_store_memory
+ 
+-            op_total_reserved = reserved_for_tasks.add(reserved_for_outputs)
+-            remaining = remaining.subtract(op_total_reserved)
++            additional_task_reservation = reserved_for_tasks.subtract(
++                admission_floor
++            ).max(ExecutionResources.zero())
++            additional_op_reservation = additional_task_reservation.add(
++                reserved_for_outputs
++            )
++            remaining = remaining.subtract(additional_op_reservation)
+             remaining = remaining.max(ExecutionResources.zero())
+ 
+         self._total_shared = remaining
++        self._update_allocation_targets()
++
++    def _update_allocation_targets(self) -> None:
++        reserved = {
++            op: self._get_total_reserved(op) for op in self._op_reserved
++        }
++        maximum = {
++            op: op.min_max_resource_requirements()[1] or ExecutionResources.inf()
++            for op in self._op_reserved
++        }
++
++        def shared(resource: str) -> float:
++            consumers = sum(
++                getattr(maximum[op], resource) > getattr(reserved[op], resource)
++                for op in self._op_reserved
++            )
++            return getattr(self._total_shared, resource) / max(consumers, 1)
++
++        shared_resources = ExecutionResources(
++            cpu=shared("cpu"),
++            gpu=shared("gpu"),
++            memory=shared("memory"),
++            object_store_memory=(
++                self._total_shared.object_store_memory / len(self._op_reserved)
++            ),
++        )
++        for op in self._op_reserved:
++            self._allocation_targets[op] = reserved[op].add(shared_resources).min(
++                maximum[op]
++            )
+ 
+     def _warn_if_op_starved_too_long(self, op: PhysicalOperator) -> None:
+         # The operator isn't starved. Return early.
+@@ -779,6 +1147,13 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+ 
+     def can_submit_new_task(self, op: PhysicalOperator) -> bool:
+         """Return whether the given operator can submit a new task based on budget."""
++        admission_state = self._resource_manager.get_resource_admission_state(op)
++        if (
++            admission_state is not None
++            and admission_state is not ResourceAdmissionState.ADMITTED
++        ):
++            return False
++
+         budget = self.get_budget(op)
+ 
+         if budget is None:
+@@ -805,6 +1180,11 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+             return None
+         return budget.add(self._resource_manager.get_op_usage(op))
+ 
++    def get_allocation_target(
++        self, op: PhysicalOperator
++    ) -> Optional[ExecutionResources]:
++        return self._allocation_targets.get(op)
++
+     def _get_total_reserved(self, op: PhysicalOperator) -> ExecutionResources:
+         """Get total reserved resources for an operator, including outputs reservation."""
+         op_reserved = self._op_reserved[op]
+@@ -838,8 +1218,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
+         *,
+         limits: ExecutionResources,
+     ):
+-        # Remaining resources to be distributed across operators
+-        remaining_shared = self._update_reservation(limits)
++        self._update_reservation(limits)
+ 
+         self._op_budgets.clear()
+         eligible_ops = self._get_eligible_ops()
+diff --git a/python/ray/data/_internal/execution/streaming_executor.py b/python/ray/data/_internal/execution/streaming_executor.py
+index 1bf651f903..60f80e93dc 100644
+--- a/python/ray/data/_internal/execution/streaming_executor.py
++++ b/python/ray/data/_internal/execution/streaming_executor.py
+@@ -38,6 +38,7 @@ from ray.data._internal.execution.streaming_executor_state import (
+     format_op_state_summary,
+     process_completed_tasks,
+     select_operator_to_run,
++    start_streaming_topology,
+     update_operator_states,
+ )
+ from ray.data._internal.logging import (
+@@ -222,7 +223,10 @@ class StreamingExecutor(Executor, threading.Thread):
+         # Setup the streaming DAG topology and start the runner thread.
+         self._block_ref_counter = BlockRefCounter()
+         self._topology = build_streaming_topology(
+-            dag, self._options, self._block_ref_counter
++            dag,
++            self._options,
++            self._block_ref_counter,
++            start_operators=False,
+         )
+ 
+         self._resource_manager = ResourceManager(
+@@ -232,6 +236,9 @@ class StreamingExecutor(Executor, threading.Thread):
+             self._data_context,
+             self._block_ref_counter,
+         )
++        start_streaming_topology(
++            self._topology, self._options, self._block_ref_counter
++        )
+ 
+         # Constructed once per executor (not per scheduling iteration) so the
+         # guard's idle-detection state accumulates across scheduling iterations.
+diff --git a/python/ray/data/_internal/execution/streaming_executor_state.py b/python/ray/data/_internal/execution/streaming_executor_state.py
+index 25446a3fe9..4726b2a529 100644
+--- a/python/ray/data/_internal/execution/streaming_executor_state.py
++++ b/python/ray/data/_internal/execution/streaming_executor_state.py
+@@ -35,6 +35,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
+ )
+ from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+ from ray.data._internal.execution.ranker import Ranker
++from ray.data._internal.execution.resource_admission import ResourceAdmissionState
+ from ray.data._internal.execution.resource_manager import (
+     ResourceManager,
+     terminal_operator_from_topology,
+@@ -198,6 +199,13 @@ class OutputBackpressureGuard:
+         in that case there is no budget-based throttling to wait on, so the
+         liveness check shouldn't claim downstream is blocked on resources.
+         """
++        # An allocation alone is not schedulability. In particular, a managed GPU
++        # pool can have queued input while admission intentionally leaves it with
++        # no runnable actor. Let upstream streaming generators drain so their
++        # actors can finish and hand resources to the admission frontier.
++        admission_state = self._resource_manager.get_resource_admission_state(op)
++        if isinstance(admission_state, ResourceAdmissionState) and not op.can_add_input():
++            return False
+         if not self._resource_manager.op_resource_allocator_enabled():
+             return True
+         return self._resource_manager.op_resource_allocator.can_submit_new_task(op)
+@@ -547,6 +555,8 @@ def build_streaming_topology(
+     dag: PhysicalOperator,
+     options: ExecutionOptions,
+     block_ref_counter: BlockRefCounter,
++    *,
++    start_operators: bool = True,
+ ) -> Topology:
+     """Instantiate the streaming operator state topology for the given DAG.
+ 
+@@ -559,6 +569,9 @@ def build_streaming_topology(
+         options: The execution options to use to start operators.
+         block_ref_counter: The executor-wide shared counter for tracking
+             object-store memory.
++        start_operators: Whether to start operators while building the topology.
++            The streaming executor disables this so resource admission can apply
++            initial zero-unit grants before any resource-owning workers start.
+ 
+     Returns:
+         The topology dict holding the streaming execution state.
+@@ -580,13 +593,24 @@ def build_streaming_topology(
+         # Create state.
+         op_state = OpState(op, inqueues)
+         topology[op] = op_state
+-        op.start(options, block_ref_counter)
++        if start_operators:
++            op.start(options, block_ref_counter)
+         return op_state
+ 
+     setup_state(dag)
+     return topology
+ 
+ 
++def start_streaming_topology(
++    topology: Topology,
++    options: ExecutionOptions,
++    block_ref_counter: BlockRefCounter,
++) -> None:
++    """Start an already-built topology in deterministic topological order."""
++    for op in topology:
++        op.start(options, block_ref_counter)
++
++
+ def process_completed_tasks(
+     topology: Topology,
+     backpressure_policies: List[BackpressurePolicy],
+@@ -776,6 +800,7 @@ def get_eligible_operators(
+     backpressure_policies: List[BackpressurePolicy],
+     *,
+     ensure_liveness: bool,
++    resource_manager: Optional[ResourceManager] = None,
+ ) -> List[PhysicalOperator]:
+     """This method returns all operators that are eligible for execution in the current state
+     of the pipeline.
+@@ -796,6 +821,29 @@ def get_eligible_operators(
+     eligible_ops: List[PhysicalOperator] = []
+ 
+     for op, state in topology.items():
++        admission_state = (
++            resource_manager.get_resource_admission_state(op)
++            if resource_manager is not None
++            else None
++        )
++        if (
++            isinstance(admission_state, ResourceAdmissionState)
++            and admission_state is not ResourceAdmissionState.ADMITTED
++        ):
++            if admission_state is ResourceAdmissionState.FRONTIER:
++                # A frontier may own an atomic pending acquisition for cluster
++                # autoscaling. Poll its asynchronous lifecycle without allowing
++                # it to consume input before it becomes admitted.
++                op.can_add_input()
++            # This is a hard lifecycle constraint, not ordinary resource
++            # backpressure. In particular, the liveness fallback must never let
++            # a FRONTIER/BLOCKED/DORMANT pool leapfrog and accept new input.
++            state._scheduling_status = OpSchedulingStatus(
++                runnable=False, under_resource_limits=False
++            )
++            op.notify_in_task_submission_backpressure(True, "ResourceAdmissionControl")
++            continue
++
+         # Operator is considered being in task-submission back-pressure if any
+         # back-pressure policy is violated. Track the first triggered policy.
+         triggered_policy = None
+@@ -867,6 +915,7 @@ def select_operator_to_run(
+         topology,
+         backpressure_policies,
+         ensure_liveness=ensure_liveness,
++        resource_manager=resource_manager,
+     )
+ 
+     if not eligible_ops:
+diff --git a/python/ray/data/_internal/gpu_shuffle/hash_aggregate.py b/python/ray/data/_internal/gpu_shuffle/hash_aggregate.py
+index af804fc8dd..3ae28446e5 100644
+--- a/python/ray/data/_internal/gpu_shuffle/hash_aggregate.py
++++ b/python/ray/data/_internal/gpu_shuffle/hash_aggregate.py
+@@ -199,9 +199,7 @@ class GPUAggregateFn(abc.ABC):
+         Subclasses should override this when all-null accumulator values are not
+         semantically correct for empty global input.
+         """
+-        return {
+-            column: None for column in self._accumulator_columns(accumulator_prefix)
+-        }
++        return dict.fromkeys(self._accumulator_columns(accumulator_prefix))
+ 
+     def _partial_accumulator_dtypes(
+         self,
+@@ -215,9 +213,7 @@ class GPUAggregateFn(abc.ABC):
+         Subclasses should override this when accumulator columns require explicit
+         dtype normalization.
+         """
+-        return {
+-            column: None for column in self._accumulator_columns(accumulator_prefix)
+-        }
++        return dict.fromkeys(self._accumulator_columns(accumulator_prefix))
+ 
+     def _final_cudf_dtypes(
+         self,
+@@ -1511,7 +1507,7 @@ class GPUHashAggregateActor:
+             else None
+         )
+ 
+-    def setup_root(self) -> Tuple[int, bytes]:
++    def setup_root(self) -> bytes:
+         logger.info("UCXX setup_root starting on GPU hash aggregate rank 0.")
+         t0 = time.perf_counter()
+         result = self._shuffler.setup_root()
+@@ -1521,7 +1517,7 @@ class GPUHashAggregateActor:
+             elapsed,
+             result[0],
+         )
+-        return result
++        return result[1]
+ 
+     def setup_worker(self, root_address: bytes) -> None:
+         logger.info(
+diff --git a/python/ray/data/_internal/gpu_shuffle/hash_shuffle.py b/python/ray/data/_internal/gpu_shuffle/hash_shuffle.py
+index 3c9e0ffb30..d8832fbfb9 100644
+--- a/python/ray/data/_internal/gpu_shuffle/hash_shuffle.py
++++ b/python/ray/data/_internal/gpu_shuffle/hash_shuffle.py
+@@ -3,6 +3,7 @@ import logging
+ import pickle
+ import time
+ import typing
++from enum import Enum
+ from typing import (
+     Any,
+     Callable,
+@@ -15,7 +16,6 @@ from typing import (
+ )
+ 
+ import ray
+-import ray.exceptions
+ from ray.actor import ActorHandle
+ from ray.data import ExecutionOptions
+ from ray.data._internal.execution.bundle_queue import ReorderingBundleQueue
+@@ -31,6 +31,12 @@ from ray.data._internal.execution.interfaces.physical_operator import (
+     OpTask,
+     estimate_total_num_of_blocks,
+ )
++from ray.data._internal.execution.resource_admission import (
++    AdmissionBundle,
++    AdmissionKind,
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++)
+ from ray.data._internal.execution.operators.hash_shuffle import (
+     _get_total_cluster_resources,
+ )
+@@ -38,6 +44,8 @@ from ray.data._internal.execution.operators.sub_progress import SubProgressBarMi
+ from ray.data._internal.stats import OpRuntimeMetrics
+ from ray.data.block import Block, BlockAccessor, BlockStats, to_stats
+ from ray.data.context import DataContext
++from ray.util.placement_group import placement_group, remove_placement_group
++from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+ 
+ if typing.TYPE_CHECKING:
+     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
+@@ -99,8 +107,8 @@ class GPUShuffleActor:
+     # UCXX communicator setup
+     # ------------------------------------------------------------------
+ 
+-    def setup_root(self) -> tuple[int, bytes]:
+-        """Initialize the root communicator and return ``(rank, root_address_bytes)``.
++    def setup_root(self) -> bytes:
++        """Initialize the root communicator and return its address.
+ 
+         Only called on rank 0; the returned address is broadcast to all ranks
+         via :meth:`setup_worker`.
+@@ -110,7 +118,7 @@ class GPUShuffleActor:
+         result = self._shuffler.setup_root()
+         elapsed = time.perf_counter() - t0
+         logger.info("UCXX setup_root completed in %.2fs (rank=%d).", elapsed, result[0])
+-        return result
++        return result[1]
+ 
+     def setup_worker(self, root_address: bytes) -> None:
+         """Finish UCXX communicator setup and create the internal shuffler.
+@@ -214,6 +222,15 @@ class GPUShuffleActor:
+ # ---------------------------------------------------------------------------
+ 
+ 
++class GPURankPoolState(Enum):
++    INACTIVE = "inactive"
++    RESERVING = "reserving"
++    STARTING = "starting"
++    READY = "ready"
++    CLOSED = "closed"
++    FAILED = "failed"
++
++
+ class GPURankPool:
+     """Manages the lifecycle of ``GPUShuffleActor`` instances.
+ 
+@@ -240,11 +257,27 @@ class GPURankPool:
+         self._log_label = log_label
+         self._label_selector = label_selector
+         self._actors: List[ActorHandle] = []
+-        self._shutdown: bool = False
++        self._placement_group = None
++        self._worker_setup_refs: List[ray.ObjectRef] = []
++        self._setup_start_time: Optional[float] = None
++        self._state = GPURankPoolState.INACTIVE
++        self._failure: Optional[BaseException] = None
+ 
+     @property
+     def is_shutdown(self) -> bool:
+-        return self._shutdown
++        return self._state is GPURankPoolState.CLOSED
++
++    @property
++    def state(self) -> GPURankPoolState:
++        return self._state
++
++    @property
++    def owns_resources(self) -> bool:
++        return self._state in (
++            GPURankPoolState.RESERVING,
++            GPURankPoolState.STARTING,
++            GPURankPoolState.READY,
++        )
+ 
+     @property
+     def nranks(self) -> int:
+@@ -254,119 +287,163 @@ class GPURankPool:
+     def actors(self) -> List[ActorHandle]:
+         return self._actors
+ 
+-    def start(self) -> None:
+-        timeout = self._setup_timeout_s
+-        t_start = time.perf_counter()
++    @property
++    def pending_setup_refs(self) -> Tuple[ray.ObjectRef, ...]:
++        return tuple(self._worker_setup_refs)
+ 
++    def activate(self) -> None:
++        if self._state is not GPURankPoolState.INACTIVE:
++            return
+         logger.info(
+-            "%s: creating %d actor(s) (total_nparts=%d).",
++            "%s: reserving an atomic %d-rank placement group (total_nparts=%d).",
+             self._log_label,
+             self._nranks,
+             self._total_nparts,
+         )
++        self._setup_start_time = time.perf_counter()
++        try:
++            placement_group_options: Dict[str, Any] = {
++                "bundles": [{"CPU": 1.0, "GPU": 1.0} for _ in range(self._nranks)],
++                "strategy": "SPREAD",
++            }
++            if self._label_selector:
++                placement_group_options["bundle_label_selector"] = [
++                    dict(self._label_selector) for _ in range(self._nranks)
++                ]
++            self._placement_group = placement_group(**placement_group_options)
++            self._state = GPURankPoolState.RESERVING
++            self._start_rank_actors()
++        except BaseException as exc:
++            self.fail(exc)
++            raise
++
++    def poll_ready(self) -> bool:
++        if self._state is GPURankPoolState.READY:
++            return True
++        if self._state is GPURankPoolState.FAILED:
++            assert self._failure is not None
++            raise self._failure
++        if self._state in (
++            GPURankPoolState.INACTIVE,
++            GPURankPoolState.RESERVING,
++            GPURankPoolState.CLOSED,
++        ):
++            return False
++
++        try:
++            self._raise_if_setup_timed_out()
++            if self._worker_setup_refs:
++                ready, pending = ray.wait(
++                    self._worker_setup_refs,
++                    num_returns=len(self._worker_setup_refs),
++                    timeout=0,
++                )
++                if ready:
++                    ray.get(ready)
++                self._worker_setup_refs = list(pending)
++                if self._worker_setup_refs:
++                    return False
++
++            self._state = GPURankPoolState.READY
++            assert self._setup_start_time is not None
++            logger.info(
++                "%s: all %d rank(s) are ready in %.2fs.",
++                self._log_label,
++                self._nranks,
++                time.perf_counter() - self._setup_start_time,
++            )
++            return True
++        except BaseException as exc:
++            self.fail(exc)
++            raise
++
++    def _start_rank_actors(self) -> None:
++        assert self._placement_group is not None
+         actor_cls = self._actor_cls_factory()
+-        actor_options: Dict[str, typing.Any] = {
+-            "num_gpus": 1,
+-            "scheduling_strategy": "SPREAD",
+-        }
+-        if self._label_selector:
+-            actor_options["label_selector"] = self._label_selector
+-        self._actors = [
+-            actor_cls.options(**actor_options).remote(
+-                nranks=self._nranks,
+-                total_nparts=self._total_nparts,
+-                **self._actor_kwargs,
++        for rank in range(self._nranks):
++            scheduling_strategy = PlacementGroupSchedulingStrategy(
++                placement_group=self._placement_group,
++                placement_group_bundle_index=rank,
++                placement_group_capture_child_tasks=False,
++            )
++            self._actors.append(
++                actor_cls.options(
++                    num_cpus=1,
++                    num_gpus=1,
++                    scheduling_strategy=scheduling_strategy,
++                ).remote(
++                    nranks=self._nranks,
++                    total_nparts=self._total_nparts,
++                    **self._actor_kwargs,
++                )
+             )
+-            for _ in range(self._nranks)
++        self._state = GPURankPoolState.STARTING
++        root_address_ref = self._actors[0].setup_root.remote()
++        self._worker_setup_refs = [
++            actor.setup_worker.remote(root_address_ref) for actor in self._actors
+         ]
+-        t_actors = time.perf_counter()
+-        logger.info(
+-            "%s: %d actor(s) created in %.2fs.",
+-            self._log_label,
+-            self._nranks,
+-            t_actors - t_start,
+-        )
+ 
+-        remaining = max(0, timeout - (time.perf_counter() - t_start))
+-        logger.info("%s: calling setup_root on rank 0.", self._log_label)
+-        try:
+-            _, root_address_bytes = ray.get(
+-                self._actors[0].setup_root.remote(), timeout=remaining
+-            )
+-        except ray.exceptions.GetTimeoutError:
++    def _raise_if_setup_timed_out(self) -> None:
++        assert self._setup_start_time is not None
++        if time.perf_counter() - self._setup_start_time >= self._setup_timeout_s:
+             raise TimeoutError(
+-                f"UCXX setup_root on {self._log_label} rank 0 did not complete "
+-                f"within {timeout}s. Check GPU/network health."
++                f"{self._log_label} placement-group and UCXX setup did not "
++                f"complete within {self._setup_timeout_s}s "
++                f"(state={self._state.value}). Check cluster capacity and "
++                "GPU/network health."
+             )
+-        t_root = time.perf_counter()
+-        logger.info(
+-            "%s: setup_root completed in %.2fs, "
+-            "broadcasting root address (%d bytes) to %d worker(s).",
+-            self._log_label,
+-            t_root - t_actors,
+-            len(root_address_bytes),
+-            self._nranks,
+-        )
+ 
+-        remaining = max(0, timeout - (time.perf_counter() - t_start))
+-        worker_refs = [
+-            actor.setup_worker.remote(root_address_bytes) for actor in self._actors
+-        ]
+-        self._wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
+-        t_done = time.perf_counter()
+-        logger.info(
+-            "%s: all %d worker(s) setup completed in %.2fs "
+-            "(total UCXX init: %.2fs).",
+-            self._log_label,
+-            self._nranks,
+-            t_done - t_root,
+-            t_done - t_start,
+-        )
++    def fail(self, exc: BaseException) -> None:
++        """Fail the gang and atomically release every rank resource."""
++        if self._state in (GPURankPoolState.FAILED, GPURankPoolState.CLOSED):
++            return
++        self._cleanup_resources()
++        self._failure = exc
++        self._state = GPURankPoolState.FAILED
++
++    def _cleanup_resources(self) -> None:
++        for actor in self._actors:
++            try:
++                ray.kill(actor)
++            except Exception:
++                logger.debug(
++                    "%s: failed to kill rank actor during cleanup.",
++                    self._log_label,
++                    exc_info=True,
++                )
++        self._actors.clear()
++        if self._placement_group is not None:
++            try:
++                remove_placement_group(self._placement_group)
++            except Exception:
++                logger.debug(
++                    "%s: failed to remove placement group during cleanup.",
++                    self._log_label,
++                    exc_info=True,
++                )
++        self._placement_group = None
++        self._worker_setup_refs.clear()
++        self._setup_start_time = None
+ 
+     def get_actor_for_block(self, block_idx: int) -> ActorHandle:
+         """Round-robin distribution of input blocks across ranks."""
++        if self._state is not GPURankPoolState.READY:
++            raise RuntimeError(
++                f"{self._log_label} cannot accept input while {self._state.value}."
++            )
+         return self._actors[block_idx % self._nranks]
+ 
+-    def shutdown(self, force: bool = False) -> None:
+-        if force:
+-            for actor in self._actors:
+-                ray.kill(actor)
+-        self._actors.clear()
+-        self._shutdown = True
++    def deactivate(self) -> None:
++        if not self.owns_resources:
++            return
++        self._cleanup_resources()
++        self._state = GPURankPoolState.INACTIVE
+ 
+-    def _wait_for_refs_with_timeout(
+-        self,
+-        refs: List[ray.ObjectRef],
+-        timeout_s: float,
+-        task_name: str,
+-    ) -> None:
+-        """Poll ``refs`` in a loop, raising on timeout or task failure."""
+-        total = len(refs)
+-        pending = list(refs)
+-        t_start = time.perf_counter()
+-
+-        while pending:
+-            elapsed = time.perf_counter() - t_start
+-            if elapsed >= timeout_s:
+-                pending_indices = [i for i, ref in enumerate(refs) if ref in pending]
+-                raise TimeoutError(
+-                    f"{task_name} did not complete on {len(pending)}/{total} "
+-                    f"rank(s) within {timeout_s}s "
+-                    f"(pending ranks: {pending_indices}). "
+-                    f"Check GPU/network health."
+-                )
+-            ready, pending = ray.wait(
+-                pending, num_returns=len(pending), timeout=min(0.1, timeout_s - elapsed)
+-            )
+-            if ready:
+-                ray.get(ready)
+-                logger.info(
+-                    "%s: %d/%d rank(s) completed %s.",
+-                    self._log_label,
+-                    total - len(pending),
+-                    total,
+-                    task_name,
+-                )
++    def shutdown(self, force: bool = False) -> None:
++        if self._state is GPURankPoolState.CLOSED:
++            return
++        self._cleanup_resources()
++        self._state = GPURankPoolState.CLOSED
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -407,8 +484,9 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+ 
+     Lifecycle::
+ 
+-        start()                    # creates actors, blocks for UCXX setup
+-        _add_input_inner(bundle)   # routes blocks to actors round-robin
++        start()                    # local initialization only
++        apply_resource_admission_grant() # asynchronously activates the rank gang
++        _add_input_inner(bundle)   # routes blocks once every rank is ready
+         [inputs_done()]            # called by the executor
+         has_next() / _get_next_inner()   # streams output bundles
+ 
+@@ -469,6 +547,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+             log_label="GPUShufflePool",
+             label_selector=data_context.execution_options.label_selector,
+         )
++        self._admission_grant = ResourceAdmissionGrant(max_units=0)
+ 
+         self._next_block_idx: int = 0
+         self._insert_tasks: Dict[int, MetadataOpTask] = {}
+@@ -496,7 +575,67 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+         block_ref_counter: "BlockRefCounter",
+     ) -> None:
+         super().start(options, block_ref_counter)
+-        self._rank_pool.start()
++        if self.resource_admission_spec() is None:
++            self._admission_grant = ResourceAdmissionGrant(max_units=1)
++        self._maybe_activate_rank_pool()
++
++    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
++        if not self.data_context._enable_resource_admission_control:
++            return None
++        label_selector = tuple(
++            sorted((self.data_context.execution_options.label_selector or {}).items())
++        )
++        rank_bundle = AdmissionBundle(
++            resources=ExecutionResources(cpu=1, gpu=1),
++            label_selector=label_selector,
++        )
++        return ResourceAdmissionSpec(
++            kind=AdmissionKind.FIXED_GANG,
++            minimum_bundles=(rank_bundle,) * self._rank_pool.nranks,
++            unit_bundle=None,
++            max_units=1,
++            sticky_after_start=True,
++        )
++
++    def has_internal_admission_demand(self) -> bool:
++        return (
++            self._next_block_idx > 0
++            and self._rank_pool.state
++            not in (GPURankPoolState.CLOSED, GPURankPoolState.FAILED)
++        ) or (self._inputs_complete and not self._finalization_started)
++
++    def apply_resource_admission_grant(self, grant: ResourceAdmissionGrant) -> None:
++        assert grant.max_units in (0, 1)
++        if grant.max_units == 0 and not self.can_release_resource_admission():
++            return
++        self._admission_grant = grant
++        if grant.max_units == 0:
++            self._rank_pool.deactivate()
++        else:
++            self._maybe_activate_rank_pool()
++
++    def can_release_resource_admission(self) -> bool:
++        return self._rank_pool.state in (
++            GPURankPoolState.CLOSED,
++            GPURankPoolState.FAILED,
++        ) or (self._next_block_idx == 0 and not self._finalization_started)
++
++    def _maybe_activate_rank_pool(self) -> None:
++        if (
++            self._started
++            and self._admission_grant.max_units == 1
++            and self._rank_pool.state is GPURankPoolState.INACTIVE
++        ):
++            self._rank_pool.activate()
++
++    def _poll_rank_pool_ready(self) -> bool:
++        self._maybe_activate_rank_pool()
++        return self._rank_pool.poll_ready()
++
++    def can_add_input(self) -> bool:
++        if self._admission_grant.max_units == 0:
++            return False
++        return self._poll_rank_pool_ready()
+ 
+     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
+         self._shuffle_metrics.on_input_received(bundle)
+@@ -538,6 +677,8 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+         """Schedule extraction once all inserts have completed."""
+         if self._finalization_started or not self._is_inserting_done():
+             return
++        if not self._poll_rank_pool_ready():
++            return
+ 
+         self._finalization_started = True
+         # Running count of partitions extracted, used for metrics only.
+@@ -617,9 +758,13 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+             rank: int = -1,
+         ) -> None:
+             self._extraction_tasks.pop(rank, None)
++            if exc is not None:
++                self._rank_pool.fail(exc)
++                return
+             if not self._extraction_tasks:
+                 # release GPU actors so downstream operators can acquire those GPUs
+-                self._rank_pool.shutdown()
++                if self._rank_pool.state is not GPURankPoolState.FAILED:
++                    self._rank_pool.shutdown(force=True)
+ 
+         for rank_idx, actor in enumerate(self._rank_pool.actors):
+             block_gen = actor.finish_and_extract.options(
+@@ -658,7 +803,19 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+     # ------------------------------------------------------------------
+ 
+     def get_active_tasks(self) -> List[OpTask]:
+-        return list(self._insert_tasks.values()) + list(self._extraction_tasks.values())
++        return (
++            [
++                MetadataOpTask(
++                    task_index=rank,
++                    object_ref=setup_ref,
++                    task_done_callback=self._poll_rank_pool_ready,
++                    task_resource_bundle=None,
++                )
++                for rank, setup_ref in enumerate(self._rank_pool.pending_setup_refs)
++            ]
++            + list(self._insert_tasks.values())
++            + list(self._extraction_tasks.values())
++        )
+ 
+     def has_completed(self) -> bool:
+         return (
+@@ -683,17 +840,22 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
+ 
+     def current_logical_usage(self) -> ExecutionResources:
+         pool = self._rank_pool
+-        if pool.is_shutdown:
++        if not pool.owns_resources:
+             return ExecutionResources(gpu=0)
+-        gpus = len(pool.actors) or pool.nranks
+-        return ExecutionResources(gpu=gpus)
++        return ExecutionResources(cpu=pool.nranks, gpu=pool.nranks)
+ 
+     @property
+     def base_resource_usage(self) -> ExecutionResources:
+-        return ExecutionResources(gpu=self._rank_pool.nranks)
++        return ExecutionResources(cpu=self._rank_pool.nranks, gpu=self._rank_pool.nranks)
++
++    def min_max_resource_requirements(
++        self,
++    ) -> Tuple[ExecutionResources, ExecutionResources]:
++        gang = self.base_resource_usage
++        return gang, gang.copy(object_store_memory=float("inf"))
+ 
+     def incremental_resource_usage(self) -> ExecutionResources:
+-        return ExecutionResources(gpu=1)
++        return ExecutionResources(cpu=1, gpu=1)
+ 
+     def get_actor_info(self) -> "ActorPoolInfo":
+         from ray.data._internal.execution.interfaces.physical_operator import (
+diff --git a/python/ray/data/context.py b/python/ray/data/context.py
+index f600a36da5..1b2b187a72 100644
+--- a/python/ray/data/context.py
++++ b/python/ray/data/context.py
+@@ -253,6 +253,13 @@ DEFAULT_ENABLE_OP_RESOURCE_RESERVATION = env_bool(
+     "RAY_DATA_ENABLE_OP_RESOURCE_RESERVATION", True
+ )
+ 
++# Internal rollback switch for resource-aware admission of GPU actor pools with
++# statically declared resources. Keep this private until the policy has had enough
++# production exposure.
++_DEFAULT_ENABLE_RESOURCE_ADMISSION_CONTROL = env_bool(
++    "RAY_DATA_ENABLE_RESOURCE_ADMISSION_CONTROL", True
++)
++
+ DEFAULT_OP_RESOURCE_RESERVATION_RATIO = float(
+     os.environ.get("RAY_DATA_OP_RESERVATION_RATIO", "0.5")
+ )
+@@ -844,6 +851,9 @@ class DataContext:
+     max_map_retries: int = DEFAULT_MAX_MAP_RETRIES
+     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
+     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
++    _enable_resource_admission_control: bool = (
++        _DEFAULT_ENABLE_RESOURCE_ADMISSION_CONTROL
++    )
+     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS
+     log_internal_stack_trace_to_stdout: bool = (
+         DEFAULT_LOG_INTERNAL_STACK_TRACE_TO_STDOUT
+diff --git a/python/ray/data/tests/test_actor_pool_map_operator.py b/python/ray/data/tests/test_actor_pool_map_operator.py
+index d3d5cb5b03..3f9a8b85ce 100644
+--- a/python/ray/data/tests/test_actor_pool_map_operator.py
++++ b/python/ray/data/tests/test_actor_pool_map_operator.py
+@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+ from unittest.mock import MagicMock, patch
+ 
+ import pyarrow as pa
++import pyarrow.compute as pc
+ import pytest
+ from freezegun import freeze_time
+ 
+@@ -37,6 +38,7 @@ from ray.data._internal.execution.interfaces import (
+ from ray.data._internal.execution.interfaces.ref_bundle import BlockEntry, RefBundle
+ from ray.data._internal.execution.interfaces.task_context import TaskContext
+ from ray.data._internal.execution.operators.actor_pool_map_operator import (
++    ActorPoolMapOperator,
+     _ActorPool,
+     _MapWorker,
+ )
+@@ -46,10 +48,17 @@ from ray.data._internal.execution.operators.map_transformer import (
+     BlockMapTransformFn,
+     MapTransformer,
+ )
++from ray.data._internal.execution.resource_admission import (
++    AdmissionKind,
++    ResourceAdmissionGrant,
++)
++from ray.data._internal.execution.resource_manager import _ResourceAdmissionController
+ from ray.data._internal.execution.streaming_executor_state import (
+     build_streaming_topology,
+     update_operator_states,
+ )
++from ray.data._internal.logical.optimizers import get_execution_plan
++from ray.data._internal.stats import Timer
+ from ray.data._internal.execution.util import make_ref_bundles
+ from ray.data.block import Block, BlockAccessor, BlockMetadata
+ from ray.data.context import (
+@@ -67,6 +76,10 @@ from ray.data.tests.util import (
+ from ray.tests.client_test_utils import create_remote_signal_actor
+ from ray.tests.conftest import *  # noqa
+ from ray.types import ObjectRef
++from ray.util.scheduling_strategies import (
++    NodeAffinitySchedulingStrategy,
++    PlacementGroupSchedulingStrategy,
++)
+ 
+ 
+ @ray.remote
+@@ -81,6 +94,39 @@ class PoolWorker:
+         pass
+ 
+ 
++def _replace_id_column(batch: pa.Table, values) -> pa.Table:
++    return pa.Table.from_arrays([values], names=["id"])
++
++
++class _AdmissionGPUStageOne:
++    def __call__(self, batch: pa.Table) -> pa.Table:
++        return _replace_id_column(batch, pc.add(batch["id"], 1))
++
++
++class _AdmissionGPUStageTwo:
++    def __call__(self, batch: pa.Table) -> pa.Table:
++        return _replace_id_column(batch, pc.add(batch["id"], 2))
++
++
++class _AdmissionGPUStageThree:
++    def __call__(self, batch: pa.Table) -> pa.Table:
++        return _replace_id_column(batch, pc.add(batch["id"], 3))
++
++
++def _admission_cpu_stage(batch: pa.Table) -> pa.Table:
++    return _replace_id_column(batch, pc.multiply(batch["id"], 2))
++
++
++def _make_gpu_actor_op(data_context, compute_strategy):
++    return MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=compute_strategy,
++        ray_remote_args={"num_gpus": 1},
++    )
++
++
+ def _make_bundle_queue(n_or_bundles) -> HashLinkedQueue:
+     """Build a HashLinkedQueue from an int (generates n ref bundles) or a bundle list."""
+     if isinstance(n_or_bundles, int):
+@@ -979,6 +1025,374 @@ def test_setting_initial_size_for_actor_pool():
+     ray.shutdown()
+ 
+ 
++@pytest.mark.parametrize(
++    "remote_args,remote_args_fn,reservation,wait_s,enabled,expected",
++    [
++        ({"num_gpus": 1}, None, True, 0, True, True),
++        ({"num_gpus": 1}, None, True, -1, True, True),
++        ({"num_gpus": 1}, None, False, 0, True, True),
++        ({"num_gpus": 1}, None, True, 1, True, True),
++        ({"num_cpus": 1}, None, True, 0, True, False),
++        ({"num_gpus": 1}, lambda: {"num_gpus": 1}, True, 0, True, False),
++        ({"num_gpus": 1}, None, True, 0, False, False),
++    ],
++)
++def test_resource_admission_control_eligibility(
++    remote_args,
++    remote_args_fn,
++    reservation,
++    wait_s,
++    enabled,
++    expected,
++):
++    data_context = DataContext()
++    data_context.op_resource_reservation_enabled = reservation
++    data_context.wait_for_min_actors_s = wait_s
++    data_context._enable_resource_admission_control = enabled
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        # Verify autoscaling pools are covered, not only fixed-size pools.
++        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
++        ray_remote_args=remote_args,
++        ray_remote_args_fn=remote_args_fn,
++    )
++
++    spec = op.resource_admission_spec()
++    assert (spec is not None) is expected
++    if expected:
++        assert spec.kind is AdmissionKind.ELASTIC_POOL
++        assert len(spec.minimum_bundles) == 1
++        assert spec.minimum_bundles[0] == spec.unit_bundle
++        assert spec.max_units == 4
++
++
++def test_resource_admission_spec_preserves_fractional_and_custom_resources():
++    data_context = DataContext()
++    data_context.execution_options.label_selector = {"zone": "west"}
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=ActorPoolStrategy(min_size=2, max_size=8),
++        ray_remote_args={
++            "num_cpus": 0.5,
++            "num_gpus": 0.25,
++            "resources": {"custom": 0.25},
++            "accelerator_type": "L4",
++            "label_selector": {"rack": "r1"},
++        },
++    )
++
++    spec = op.resource_admission_spec()
++    assert spec.kind is AdmissionKind.ELASTIC_POOL
++    assert spec.minimum_bundles == (spec.unit_bundle,)
++    assert spec.unit_bundle.resources == ExecutionResources(cpu=0.5, gpu=0.25)
++    assert spec.unit_bundle.custom_resources == (
++        ("accelerator_type:L4", 0.001),
++        ("custom", 0.25),
++    )
++    assert spec.unit_bundle.label_selector == (("rack", "r1"), ("zone", "west"))
++    assert spec.max_units == 8
++
++
++def test_resource_admission_spec_materializes_implicit_actor_cpu():
++    data_context = DataContext()
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
++        ray_remote_args={"num_gpus": 0.25},
++    )
++
++    spec = op.resource_admission_spec()
++    assert spec is not None
++    assert spec.unit_bundle.resources == ExecutionResources(cpu=1, gpu=0.25)
++    assert op.min_scheduling_resources() == ExecutionResources(cpu=1, gpu=0.25)
++
++
++@pytest.mark.parametrize(
++    "scheduling_strategy",
++    [
++        NodeAffinitySchedulingStrategy("01" * ID_SIZE, soft=False),
++        PlacementGroupSchedulingStrategy(MagicMock(), 0),
++    ],
++)
++def test_resource_admission_rejects_unrepresentable_scheduling_strategy(
++    scheduling_strategy,
++):
++    data_context = DataContext()
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
++        ray_remote_args={"num_gpus": 1, "scheduling_strategy": scheduling_strategy},
++    )
++
++    assert op.resource_admission_spec() is None
++    assert "cannot be represented" in op._resource_admission_fallback_reason()
++
++
++def test_dynamic_remote_args_warn_with_zero_base_gpu():
++    data_context = DataContext()
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
++        ray_remote_args={"num_cpus": 1},
++        ray_remote_args_fn=lambda: {"num_gpus": 1},
++    )
++
++    assert op.min_scheduling_resources().gpu == 0
++    assert op.resource_admission_spec() is None
++    with patch(
++        "ray.data._internal.execution.resource_manager.logger.warning"
++    ) as warning:
++        controller = _ResourceAdmissionController({op: MagicMock()}, MagicMock())
++
++    assert controller.get_state(op) is None
++    warning.assert_called_once()
++    assert "ray_remote_args_fn" in warning.call_args.args[1]
++    assert "deadlock protection does not apply" in warning.call_args.args[0]
++
++
++def test_resource_admission_control_defers_actor_start(
++    ray_start_regular, restore_data_context
++):
++    data_context = DataContext.get_current()
++    data_context.op_resource_reservation_enabled = True
++    data_context.wait_for_min_actors_s = 0
++    data_context._enable_resource_admission_control = True
++    op = _make_gpu_actor_op(data_context, ActorPoolStrategy(size=2))
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++
++    op.start(ExecutionOptions(), noop_counter())
++
++    assert op.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
++    assert op._actor_pool.current_size() == 0
++    op.shutdown(Timer())
++
++
++def test_resource_admission_wait_is_async_and_starts_after_grant():
++    data_context = DataContext()
++    data_context.wait_for_min_actors_s = 10
++    data_context._enable_resource_admission_control = True
++    op = _make_gpu_actor_op(
++        data_context, ActorPoolStrategy(min_size=2, max_size=4)
++    )
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++    op._actor_pool.scale = MagicMock()
++
++    with (
++        patch(
++            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.get"
++        ) as ray_get,
++        patch(
++            "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
++        ),
++    ):
++        op.start(ExecutionOptions(), noop_counter())
++
++    ray_get.assert_not_called()
++    op._actor_pool.scale.assert_not_called()
++    assert op._min_actors_wait_start_time is None
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
++    assert op._min_actors_wait_start_time is not None
++
++
++def test_resource_admission_wait_respects_granted_floor_and_times_out():
++    data_context = DataContext()
++    data_context.wait_for_min_actors_s = 10
++    op = _make_gpu_actor_op(
++        data_context, ActorPoolStrategy(min_size=3, max_size=4)
++    )
++    op._actor_pool.current_size = MagicMock(return_value=1)
++    op._actor_pool.can_schedule_task = MagicMock(return_value=True)
++    op._actor_pool.num_running_actors = MagicMock(return_value=1)
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
++
++    # The configured minimum is three, but a one-unit grant only waits for one.
++    assert op.can_add_input()
++
++    op._actor_pool.num_running_actors.return_value = 0
++    with patch(
++        "ray.data._internal.execution.operators.actor_pool_map_operator.time.monotonic",
++        side_effect=[100, 111],
++    ):
++        op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++        op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
++        with pytest.raises(ray.exceptions.GetTimeoutError, match="Timed out"):
++            op.can_add_input()
++
++
++def test_resource_admission_grant_gates_internal_dispatch():
++    data_context = DataContext()
++    op = _make_gpu_actor_op(data_context, ActorPoolStrategy(size=2))
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
++    op._actor_pool.current_size = MagicMock(return_value=2)
++    op._actor_pool.can_schedule_task = MagicMock(return_value=True)
++    op._actor_pool.select_actors = MagicMock()
++    op._bundle_queue = MagicMock()
++    op._bundle_queue.has_next.return_value = True
++
++    # Even if an excess actor just became idle, it cannot take queued work before
++    # the autoscaler reclaims it for another GPU claimant.
++    assert not op.can_add_input()
++    assert op._try_schedule_tasks_internal() == 0
++    op._actor_pool.select_actors.assert_not_called()
++
++
++@pytest.mark.timeout(90)
++@pytest.mark.parametrize("num_gpu_stages", [2, 3])
++def test_resource_admission_handoff_one_logical_gpu(
++    shutdown_only, restore_data_context, monkeypatch, num_gpu_stages
++):
++    ray.init(num_cpus=2, num_gpus=1, include_dashboard=False)
++    data_context = DataContext.get_current()
++    data_context.op_resource_reservation_enabled = True
++    data_context.wait_for_min_actors_s = 0
++    data_context._enable_resource_admission_control = True
++
++    managed_at_execution_start = []
++    original_start = ActorPoolMapOperator.start
++
++    def record_admission_at_start(self, *args, **kwargs):
++        result = original_start(self, *args, **kwargs)
++        if self._ray_remote_args.get("num_gpus", 0) > 0:
++            managed_at_execution_start.append(
++                self.resource_admission_spec() is not None
++            )
++        return result
++
++    monkeypatch.setattr(ActorPoolMapOperator, "start", record_admission_at_start)
++
++    ds = ray.data.range(8, override_num_blocks=4).map_batches(
++        _AdmissionGPUStageOne,
++        batch_size=2,
++        batch_format="pyarrow",
++        compute=ActorPoolStrategy(size=2),
++        num_cpus=0,
++        num_gpus=1,
++        scheduling_strategy="SPREAD",
++    )
++    # Keep a CPU operator between two GPU regions. Its different compute and
++    # resource declaration also prevents it from fusing into either actor pool.
++    ds = ds.map_batches(
++        _admission_cpu_stage,
++        batch_size=2,
++        batch_format="pyarrow",
++        num_cpus=1,
++    )
++    ds = ds.map_batches(
++        _AdmissionGPUStageTwo,
++        batch_size=2,
++        batch_format="pyarrow",
++        compute=ActorPoolStrategy(size=2),
++        num_cpus=0,
++        num_gpus=1,
++        scheduling_strategy="DEFAULT",
++    )
++    if num_gpu_stages == 3:
++        # Differing scheduling strategies keep the adjacent GPU pools physically
++        # separate so the test exercises admission and handoff, not operator
++        # coalescing.
++        ds = ds.map_batches(
++            _AdmissionGPUStageThree,
++            batch_size=2,
++            batch_format="pyarrow",
++            compute=ActorPoolStrategy(size=2),
++            num_cpus=0,
++            num_gpus=1,
++            scheduling_strategy="SPREAD",
++        )
++
++    physical_plan, _ = get_execution_plan(ds._logical_plan)
++    stack = [physical_plan.dag]
++    actor_ops = []
++    while stack:
++        op = stack.pop()
++        if isinstance(op, ActorPoolMapOperator):
++            actor_ops.append(op)
++        stack.extend(op.input_dependencies)
++
++    # Each fixed pool asks for two actors, but the executor can make progress
++    # with one actor at a time and hand the sole logical GPU across all stages.
++    assert len(actor_ops) == num_gpu_stages, physical_plan.dag.dag_str
++    assert all(op.resource_admission_spec() is not None for op in actor_ops)
++    assert all(op._actor_pool.initial_size() == 2 for op in actor_ops)
++
++    expected_offset = 4 if num_gpu_stages == 2 else 7
++    assert sorted(row["id"] for row in ds.take_all()) == [
++        2 * i + expected_offset for i in range(8)
++    ]
++    # The physical memory-sizing optimizer installs an internal remote-args
++    # wrapper. It must not make a stock callable-class GPU map look like a
++    # user-supplied dynamic-resource operator at execution time.
++    assert managed_at_execution_start == [True] * num_gpu_stages
++
++
++@pytest.mark.timeout(180)
++def test_resource_admission_handoff_spills_arrow_blocks(
++    shutdown_only, restore_data_context, tmp_path
++):
++    ray.init(
++        num_cpus=2,
++        num_gpus=1,
++        object_store_memory=100e6,
++        object_spilling_directory=str(tmp_path),
++        include_dashboard=False,
++    )
++    data_context = DataContext.get_current()
++    data_context.op_resource_reservation_enabled = True
++    data_context.wait_for_min_actors_s = 0
++    data_context._enable_resource_admission_control = True
++    data_context.enable_get_object_locations_for_metrics = True
++
++    # 25.6M int64 values are about 205 MB, intentionally larger than the
++    # 100 MB object store. Both fixed pools ask for two one-GPU actors, while
++    # the cluster exposes only one logical GPU.
++    num_rows = 1000 * 80 * 80 * 4
++    ds = (
++        ray.data.range(num_rows, override_num_blocks=8)
++        .map_batches(
++            _AdmissionGPUStageOne,
++            batch_size=num_rows // 8,
++            batch_format="pyarrow",
++            compute=ActorPoolStrategy(size=2),
++            num_cpus=0,
++            num_gpus=1,
++            scheduling_strategy="SPREAD",
++        )
++        .map_batches(
++            _AdmissionGPUStageTwo,
++            batch_size=num_rows // 8,
++            batch_format="pyarrow",
++            compute=ActorPoolStrategy(size=2),
++            num_cpus=0,
++            num_gpus=1,
++            scheduling_strategy="DEFAULT",
++        )
++    )
++
++    physical_plan, _ = get_execution_plan(ds._logical_plan)
++    stack = [physical_plan.dag]
++    actor_ops = []
++    while stack:
++        op = stack.pop()
++        if isinstance(op, ActorPoolMapOperator):
++            actor_ops.append(op)
++        stack.extend(op.input_dependencies)
++    assert len(actor_ops) == 2, physical_plan.dag.dag_str
++
++    materialized = ds.materialize()
++    assert materialized.count() == num_rows
++    assert materialized.get_stats_summary().global_bytes_spilled > 0
++
++
+ def _create_bundle_with_single_row(row):
+     block = pa.Table.from_pylist([row])
+     block_ref = ray.put(block)
+@@ -1125,10 +1539,20 @@ def test_actor_pool_input_queue_draining(
+         op._bundle_queue.num_bundles() == 1
+     ), "Bundle should remain in queue since actor was busy"
+ 
++    # Model an admission-managed pool being demoted while its active task
++    # drains. The final partial bundle is already in the operator's internal
++    # queue and must not bypass the executor gate when the actor becomes idle.
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++
+     # Now complete the running task to free up the actor
+     run_op_tasks_sync(op, only_existing=True)
+ 
+-    # Now has_next() should dispatch the remaining bundle
++    op.has_next()
++    assert op._bundle_queue.num_bundles() == 1
++    assert op.num_active_tasks() == 0
++
++    # Readmission makes the internal final bundle runnable again.
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
+     assert op.has_next()
+ 
+     # The queue should be drained (task dispatched)
+@@ -1167,11 +1591,14 @@ def test_min_max_resource_requirements(restore_data_context):
+         max_resource_usage_bound,
+     ) = op.min_max_resource_requirements()
+ 
+-    # min_resource_usage: 1 actor * (1 gpu, 3 obj_store_mem)
+-    # max_resource_usage: 2 actors * (1 gpu)
+-    assert min_resource_usage_bound == ExecutionResources(gpu=1, object_store_memory=0)
++    # GPU actors default to one lifetime CPU in Ray Core.
++    # min_resource_usage: 1 actor * (1 cpu, 1 gpu, 3 obj_store_mem)
++    # max_resource_usage: 2 actors * (1 cpu, 1 gpu)
++    assert min_resource_usage_bound == ExecutionResources(
++        cpu=1, gpu=1, object_store_memory=0
++    )
+     assert max_resource_usage_bound == ExecutionResources(
+-        gpu=2, object_store_memory=float("inf")
++        cpu=2, gpu=2, object_store_memory=float("inf")
+     )
+ 
+ 
+@@ -1193,10 +1620,11 @@ def test_min_max_resource_requirements_unbounded(restore_data_context):
+         max_resource_usage_bound,
+     ) = op.min_max_resource_requirements()
+ 
+-    # Unbounded pools should return infinite max resources for GPU (which is used),
+-    # but 0 for CPU/memory (which are not specified) to prevent hoarding.
+-    assert min_resource_usage_bound == ExecutionResources(gpu=1, object_store_memory=0)
+-    assert max_resource_usage_bound == ExecutionResources.for_limits(cpu=0, memory=0)
++    # GPU actors use one implicit CPU, so both CPU and GPU are unbounded.
++    assert min_resource_usage_bound == ExecutionResources(
++        cpu=1, gpu=1, object_store_memory=0
++    )
++    assert max_resource_usage_bound == ExecutionResources.for_limits(memory=0)
+ 
+ 
+ def test_start_actor_timeout(ray_start_regular_shared, restore_data_context):
+diff --git a/python/ray/data/tests/test_autoscaler.py b/python/ray/data/tests/test_autoscaler.py
+index a5bab6fe5e..688d965a61 100644
+--- a/python/ray/data/tests/test_autoscaler.py
++++ b/python/ray/data/tests/test_autoscaler.py
+@@ -1,6 +1,7 @@
++import asyncio
+ import time
+ from contextlib import contextmanager
+-from types import MethodType
++from types import MethodType, SimpleNamespace
+ from typing import Optional
+ from unittest.mock import MagicMock, patch
+ 
+@@ -16,17 +17,442 @@ from ray.data._internal.actor_autoscaler.default_actor_autoscaler import (
+     _get_max_scale_up,
+ )
+ from ray.data._internal.cluster_autoscaler import DefaultClusterAutoscaler
+-from ray.data._internal.execution.operators.actor_pool_map_operator import _ActorPool
++from ray.data._internal.compute import ActorPoolStrategy
++from ray.data._internal.execution.interfaces import ExecutionOptions
++from ray.data._internal.execution.operators.actor_pool_map_operator import (
++    ActorPoolMapOperator,
++    _ActorPool,
++)
+ from ray.data._internal.execution.operators.base_physical_operator import (
+     InternalQueueOperatorMixin,
+ )
+-from ray.data._internal.execution.resource_manager import ResourceManager
++from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
++from ray.data._internal.execution.operators.map_operator import MapOperator
++from ray.data._internal.execution.resource_admission import (
++    AdmissionBundle,
++    AdmissionKind,
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++    ResourceAdmissionState,
++)
++from ray.data._internal.execution.resource_manager import (
++    ResourceManager,
++    _ResourceAdmissionController,
++)
+ from ray.data._internal.execution.streaming_executor_state import OpState
+ from ray.data.context import (
+     AutoscalingConfig,
++    DataContext,
+ )
+ 
+ 
++def _elastic_spec(max_units=4):
++    bundle = AdmissionBundle(ExecutionResources(gpu=1))
++    return ResourceAdmissionSpec(
++        kind=AdmissionKind.ELASTIC_POOL,
++        minimum_bundles=(bundle,),
++        unit_bundle=bundle,
++        max_units=max_units,
++        sticky_after_start=False,
++    )
++
++
++def test_resource_admission_scaling_states():
++    resource_manager = MagicMock(spec=ResourceManager)
++    resource_manager.get_allocation.return_value = ExecutionResources(gpu=2)
++    resource_manager.get_allocation_target.return_value = ExecutionResources(gpu=2)
++    resource_manager.get_op_usage.return_value = ExecutionResources(gpu=1)
++    resource_manager.get_budget.return_value = ExecutionResources(gpu=1)
++    autoscaler = DefaultActorAutoscaler(
++        topology={},
++        resource_manager=resource_manager,
++        config=AutoscalingConfig(
++            actor_pool_util_upscaling_threshold=1.0,
++            actor_pool_util_downscaling_threshold=0.5,
++            actor_pool_max_upscaling_delta=None,
++        ),
++    )
++    op = MagicMock()
++    op.resource_admission_spec.return_value = _elastic_spec()
++    op.has_completed.return_value = False
++    op.has_execution_finished.return_value = False
++    op.internal_input_queue_num_blocks.return_value = 0
++    op._inputs_complete = False
++    op.metrics.num_inputs_received = 1
++    op_state = MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1))
++    pool = MagicMock(spec=_ActorPool)
++    pool.min_size.return_value = 4
++    pool.max_size.return_value = 4
++    pool.initial_size.return_value = 4
++    pool.per_actor_resource_usage.return_value = ExecutionResources(gpu=1)
++    pool.get_pool_util.return_value = 1.0
++
++    def actor_info(*, running=0, pending=0, active=0, idle=0):
++        pool.current_size.return_value = running + pending
++        pool.num_running_actors.return_value = running
++        pool.get_actor_info.return_value = SimpleNamespace(
++            running=running,
++            pending=pending,
++            restarting=0,
++            active=active,
++            idle=idle,
++        )
++
++    # A final internally rebundled input remains live after the executor queue
++    # empties. Readmission must start an actor instead of taking the completion
++    # shortcut and leaving the bundle stranded forever.
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.ADMITTED
++    )
++    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
++        max_units=1
++    )
++    op._inputs_complete = True
++    op.internal_input_queue_num_blocks.return_value = 1
++    op_state.total_enqueued_input_blocks.return_value = 0
++    actor_info()
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
++    )
++    op._inputs_complete = False
++    op.internal_input_queue_num_blocks.return_value = 0
++    op_state.total_enqueued_input_blocks.return_value = 1
++
++    # A frontier waiting behind an admitted owner receives no autoscaling seed.
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.FRONTIER
++    )
++    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
++        max_units=0
++    )
++    actor_info()
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.no_op(reason="resource admission state is frontier")
++    )
++    actor_info(pending=1)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-1,
++            force=True,
++            reason="resource admission state is frontier",
++        )
++    )
++
++    # A frontier actor that became idle is released; it must not retain the GPU
++    # needed by an earlier admitted claimant.
++    actor_info(running=1, idle=1)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-1,
++            force=True,
++            reason="resource admission state is frontier",
++        )
++    )
++
++    # Blocked pools promptly cancel pending actors and release idle actors.
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.BLOCKED
++    )
++    actor_info(running=1, pending=1, idle=1)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-2,
++            force=True,
++            reason="resource admission state is blocked",
++        )
++    )
++
++    # Admitted pools may operate below their configured minimum. Extra actors
++    # are capped by the remaining allocation, so this asks for one rather than 3.
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.ADMITTED
++    )
++    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
++        max_units=2
++    )
++    actor_info(running=1, active=1)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
++    )
++
++    # When another claimant reduces the independent target to one actor, only
++    # the oversized pool's idle actor is force-released. Active excess actors
++    # are never preempted and will be reclaimed after they drain.
++    resource_manager.get_resource_admission_grant.return_value = ResourceAdmissionGrant(
++        max_units=1
++    )
++    actor_info(running=2, active=1, idle=1)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-1,
++            force=True,
++            reason="pool exceeding max size",
++        )
++    )
++    actor_info(running=2, active=2)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-1,
++            force=True,
++            reason="pool exceeding max size",
++        )
++    )
++
++    # Completion takes precedence over admission state and releases the whole pool.
++    op.has_execution_finished.return_value = True
++    actor_info(running=3, idle=3)
++    assert autoscaler._derive_target_scaling_config(pool, op, op_state) == (
++        ActorPoolScalingRequest.downscale(
++            delta=-3, force=True, reason="consumed all inputs"
++        )
++    )
++
++
++def _mock_admission_stage(*, inputs=()):
++    op = MagicMock()
++    op.input_dependencies = list(inputs)
++    op.resource_admission_spec.return_value = _elastic_spec(max_units=1)
++    op.has_completed.return_value = False
++    op.has_execution_finished.return_value = False
++    op.has_internal_admission_demand.return_value = False
++    op.internal_input_queue_num_blocks.return_value = 0
++    op.num_active_tasks.return_value = 0
++    op.current_logical_usage.return_value = ExecutionResources.zero()
++    op.pending_logical_usage.return_value = ExecutionResources.zero()
++    op.can_release_resource_admission.return_value = True
++    op._inputs_complete = False
++    op.metrics.num_inputs_received = 1
++
++    actor_info = SimpleNamespace(
++        running=0,
++        pending=0,
++        restarting=0,
++        active=0,
++        idle=0,
++    )
++    op.get_actor_info.return_value = actor_info
++
++    pool = MagicMock(spec=_ActorPool)
++    pool.current_size.return_value = 0
++    pool.num_running_actors.return_value = 0
++    pool.min_size.return_value = 1
++    pool.max_size.return_value = 1
++    pool.initial_size.return_value = 1
++    pool.per_actor_resource_usage.return_value = ExecutionResources(gpu=1)
++    pool.get_actor_info.return_value = actor_info
++    pool.get_pool_util.return_value = float("inf")
++    op.get_autoscaling_actor_pools.return_value = [pool]
++
++    state = MagicMock(spec=OpState)
++    state.total_enqueued_input_blocks.return_value = 1
++    return op, pool, state
++
++
++def _make_admission_autoscaler(topology, resource_manager):
++    return DefaultActorAutoscaler(
++        topology=topology,
++        resource_manager=resource_manager,
++        config=AutoscalingConfig(
++            actor_pool_util_upscaling_threshold=1.0,
++            actor_pool_util_downscaling_threshold=0.5,
++            actor_pool_max_upscaling_delta=None,
++        ),
++    )
++
++
++def test_resource_admission_sufficient_capacity_scales_all_stages_together():
++    """One autoscaler pass starts every admitted stage when all claims fit."""
++    upstream, upstream_pool, upstream_state = _mock_admission_stage()
++    downstream, downstream_pool, downstream_state = _mock_admission_stage(
++        inputs=[upstream]
++    )
++    topology = {
++        upstream: upstream_state,
++        downstream: downstream_state,
++    }
++    resource_manager = MagicMock(spec=ResourceManager)
++    resource_manager._options = ExecutionOptions()
++    resource_manager.get_global_limits.return_value = ExecutionResources(gpu=2)
++
++    controller = _ResourceAdmissionController(topology, resource_manager)
++    controller.update_states()
++    resource_manager.get_allocation_target.return_value = None
++    controller.update_grants()
++    resource_manager.get_resource_admission_state.side_effect = controller.get_state
++    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
++
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(downstream) is ResourceAdmissionState.ADMITTED
++
++    _make_admission_autoscaler(topology, resource_manager).try_trigger_scaling()
++
++    expected = ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
++    upstream_pool.scale.assert_called_once_with(expected)
++    downstream_pool.scale.assert_called_once_with(expected)
++
++
++def test_resource_admission_zero_capacity_seeds_only_autoscaling_frontier():
++    frontier, frontier_pool, frontier_state = _mock_admission_stage()
++    blocked, blocked_pool, blocked_state = _mock_admission_stage(inputs=[frontier])
++    topology = {
++        frontier: frontier_state,
++        blocked: blocked_state,
++    }
++    resource_manager = MagicMock(spec=ResourceManager)
++    resource_manager._options = ExecutionOptions()
++    resource_manager.get_global_limits.return_value = ExecutionResources.zero()
++
++    controller = _ResourceAdmissionController(topology, resource_manager)
++    controller.update_states()
++    resource_manager.get_allocation_target.return_value = None
++    controller.update_grants()
++    resource_manager.get_resource_admission_state.side_effect = controller.get_state
++    resource_manager.get_resource_admission_grant.side_effect = controller.get_grant
++    autoscaler = _make_admission_autoscaler(topology, resource_manager)
++
++    assert controller.get_state(frontier) is ResourceAdmissionState.FRONTIER
++    assert controller.get_state(blocked) is ResourceAdmissionState.BLOCKED
++    assert controller.get_grant(frontier) == ResourceAdmissionGrant(max_units=1)
++    assert controller.get_grant(blocked) == ResourceAdmissionGrant(max_units=0)
++
++    autoscaler.try_trigger_scaling()
++    frontier_pool.scale.assert_called_once_with(
++        ActorPoolScalingRequest.upscale(delta=1, reason="pool below min size")
++    )
++    blocked_pool.scale.assert_called_once_with(
++        ActorPoolScalingRequest.no_op(reason="resource admission state is blocked")
++    )
++
++
++def test_resource_admission_is_independent_of_proportional_reservations():
++    data_context = DataContext()
++    data_context.op_resource_reservation_enabled = False
++    data_context.wait_for_min_actors_s = 0
++    data_context._enable_resource_admission_control = True
++    op = MapOperator.create(
++        map_transformer=MagicMock(),
++        input_op=InputDataBuffer(data_context, input_data=[]),
++        data_context=data_context,
++        compute_strategy=ActorPoolStrategy(size=3),
++        ray_remote_args={"num_gpus": 1},
++    )
++    assert isinstance(op, ActorPoolMapOperator)
++    assert op.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
++    op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++    op._actor_pool.scale = MagicMock()
++
++    with patch(
++        "ray.data._internal.execution.operators.actor_pool_map_operator.ray.remote"
++    ):
++        op.start(ExecutionOptions(), MagicMock())
++
++    op._actor_pool.scale.assert_not_called()
++
++
++@pytest.mark.timeout(60)
++def test_resource_admission_sufficient_gpus_stream_stages_concurrently(monkeypatch):
++    """Two admitted one-GPU stages overlap instead of waiting for handoff."""
++
++    class Signal:
++        def __init__(self):
++            self._event = asyncio.Event()
++
++        async def wait(self):
++            await self._event.wait()
++
++        def send(self):
++            self._event.set()
++
++    class Upstream:
++        def __init__(self, signal):
++            self._signal = signal
++            self._calls = 0
++
++        def __call__(self, batch):
++            self._calls += 1
++            if self._calls == 2:
++                # This can finish only after the downstream stage consumes the
++                # first block, proving both one-GPU pools run concurrently.
++                ray.get(self._signal.wait.remote(), timeout=30)
++            return batch
++
++    class Downstream:
++        def __init__(self, signal):
++            self._signal = signal
++            self._sent = False
++
++        def __call__(self, batch):
++            if not self._sent:
++                ray.get(self._signal.send.remote())
++                self._sent = True
++            return batch
++
++    ray.shutdown()
++    ray.init(num_cpus=2, num_gpus=2, include_dashboard=False)
++    data_context = DataContext.get_current()
++    old_values = (
++        data_context.op_resource_reservation_enabled,
++        data_context.wait_for_min_actors_s,
++        data_context._enable_resource_admission_control,
++    )
++    data_context.op_resource_reservation_enabled = True
++    data_context.wait_for_min_actors_s = 0
++    data_context._enable_resource_admission_control = True
++
++    managed_at_execution_start = []
++    original_start = ActorPoolMapOperator.start
++
++    def record_admission_at_start(self, *args, **kwargs):
++        result = original_start(self, *args, **kwargs)
++        if self._ray_remote_args.get("num_gpus", 0) > 0:
++            managed_at_execution_start.append(
++                self.resource_admission_spec() is not None
++            )
++        return result
++
++    monkeypatch.setattr(ActorPoolMapOperator, "start", record_admission_at_start)
++
++    try:
++        signal = ray.remote(num_cpus=0)(Signal).remote()
++        ds = (
++            ray.data.range(4, override_num_blocks=2)
++            .map_batches(
++                Upstream,
++                batch_size=2,
++                compute=ActorPoolStrategy(size=1, max_tasks_in_flight_per_actor=1),
++                num_cpus=0,
++                num_gpus=1,
++                scheduling_strategy="SPREAD",
++                fn_constructor_args=[signal],
++            )
++            .map_batches(
++                Downstream,
++                batch_size=2,
++                compute=ActorPoolStrategy(size=1, max_tasks_in_flight_per_actor=1),
++                num_cpus=0,
++                num_gpus=1,
++                scheduling_strategy="DEFAULT",
++                fn_constructor_args=[signal],
++            )
++        )
++
++        assert sorted(row["id"] for row in ds.take_all()) == list(range(4))
++        assert managed_at_execution_start == [True, True]
++        deadline = time.monotonic() + 10
++        while (
++            ray.available_resources().get("GPU", 0) != 2 and time.monotonic() < deadline
++        ):
++            time.sleep(0.1)
++        assert ray.available_resources().get("GPU", 0) == 2
++    finally:
++        (
++            data_context.op_resource_reservation_enabled,
++            data_context.wait_for_min_actors_s,
++            data_context._enable_resource_admission_control,
++        ) = old_values
++        ray.shutdown()
++
++
+ def test_actor_pool_scaling():
+     """Test `_actor_pool_should_scale_up` and `_actor_pool_should_scale_down`
+     in `DefaultAutoscaler`"""
+diff --git a/python/ray/data/tests/test_gpu_aggregate.py b/python/ray/data/tests/test_gpu_aggregate.py
+index 783626b4e0..90be58a91b 100644
+--- a/python/ray/data/tests/test_gpu_aggregate.py
++++ b/python/ray/data/tests/test_gpu_aggregate.py
+@@ -16,6 +16,7 @@ import ray
+ import ray.data._internal.gpu_shuffle.hash_aggregate as hash_aggregate
+ from ray.actor import ActorClass, ActorHandle
+ from ray.data._internal.execution.interfaces import ExecutionResources, PhysicalOperator
++from ray.data._internal.execution.resource_admission import AdmissionKind
+ from ray.data._internal.gpu_shuffle.hash_aggregate import (
+     GPUAggregateFn,
+     GPUAggregationPlan,
+@@ -314,6 +315,14 @@ class TestGPUHashAggregatePlanning:
+         mock_default_pool.assert_not_called()
+         assert op._aggregation_plan is aggregation_plan
+         assert op._rank_pool.nranks == 4
++        spec = op.resource_admission_spec()
++        assert spec is not None
++        assert spec.kind is AdmissionKind.FIXED_GANG
++        assert spec.max_units == 1
++        assert spec.sticky_after_start
++        assert len(spec.minimum_bundles) == 4
++        assert all(bundle.resources.cpu == 1 for bundle in spec.minimum_bundles)
++        assert all(bundle.resources.gpu == 1 for bundle in spec.minimum_bundles)
+ 
+     def test_gpu_shuffle_unsupported_aggregate_falls_back_to_cpu_hash_aggregate(self):
+         from ray.data._internal.execution.operators.hash_aggregate import (
+@@ -868,7 +877,8 @@ class TestGPUHashAggregateActorReal:
+             ),
+         )
+ 
+-        _, root_address = ray.get(actor.setup_root.remote())
++        root_address = ray.get(actor.setup_root.remote())
++        assert isinstance(root_address, bytes)
+         ray.get(actor.setup_worker.remote(root_address))
+         return actor
+ 
+diff --git a/python/ray/data/tests/test_gpu_shuffle.py b/python/ray/data/tests/test_gpu_shuffle.py
+index f37039d03a..ac380d0970 100644
+--- a/python/ray/data/tests/test_gpu_shuffle.py
++++ b/python/ray/data/tests/test_gpu_shuffle.py
+@@ -4,6 +4,7 @@ These tests do NOT require GPUs or the rapidsmpf/cudf/ucxx packages.
+ All Ray actor calls are mocked so the tests run on a standard CPU cluster.
+ """
+ 
++import time
+ from typing import List
+ from unittest.mock import MagicMock, patch
+ 
+@@ -13,6 +14,10 @@ import pytest
+ 
+ import ray
+ import ray.data._internal.gpu_shuffle.hash_shuffle as hash_shuffle
++from ray.data import ActorPoolStrategy, ExecutionOptions
++from ray.data._internal.execution.operators.actor_pool_map_operator import (
++    ActorPoolMapOperator,
++)
+ from ray.data._internal.execution.interfaces import (
+     BlockEntry,
+     ExecutionResources,
+@@ -21,12 +26,18 @@ from ray.data._internal.execution.interfaces import (
+ )
+ from ray.data._internal.gpu_shuffle.hash_shuffle import (
+     GPURankPool,
++    GPURankPoolState,
+     GPUShuffleActor,
+     GPUShuffleOperator,
+     _derive_num_gpu_ranks,
+ )
++from ray.data._internal.execution.resource_admission import (
++    AdmissionKind,
++    ResourceAdmissionGrant,
++)
+ from ray.data._internal.logical.interfaces import LogicalOperator
+ from ray.data._internal.logical.operators import Repartition
++from ray.data._internal.logical.optimizers import get_execution_plan
+ from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
+ from ray.data._internal.util import explain_plan
+ from ray.data.block import BlockMetadata
+@@ -196,42 +207,124 @@ class TestGPURankPool:
+         pool = self._make_pool()
+         assert pool.actors == []
+ 
+-    def test_start_creates_correct_number_of_actors(self):
++    def test_activate_uses_exact_bundle_indexes_and_poll_ready_waits_for_setup(self):
+         pool = self._make_pool(nranks=3)
+-
+-        mock_actor_handles = [MagicMock() for _ in range(3)]
+-        mock_root_address = b"ucxx://fake-address"
+-
+-        # setup_root.remote() on rank 0 returns a future for (rank, address)
+-        mock_actor_handles[0].setup_root.remote.return_value = MagicMock()
+-        for handle in mock_actor_handles:
+-            handle.setup_worker.remote.return_value = MagicMock()
+-
+-        with patch(
+-            "ray.data._internal.gpu_shuffle.hash_shuffle.GPUShuffleActor"
+-        ) as mock_actor_cls, patch(
+-            "ray.data._internal.gpu_shuffle.hash_shuffle.ray.get"
+-        ) as mock_ray_get, patch(
+-            "ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait"
+-        ) as mock_ray_wait:
+-            mock_actor_cls.options.return_value.remote.side_effect = mock_actor_handles
+-            # First ray.get returns (rank, root_address); second returns None list (setup done)
+-            mock_ray_get.side_effect = [(0, mock_root_address), [None, None, None]]
+-            # ray.wait returns all refs as ready
+-            worker_refs = [
+-                h.setup_worker.remote.return_value for h in mock_actor_handles
+-            ]
++        pool._label_selector = {"accelerator": "h100"}
++        fake_pg = MagicMock()
++        root_ref = MagicMock(name="root")
++        worker_refs = [MagicMock(name=f"worker_{i}") for i in range(3)]
++        actor_handles = [MagicMock(name=f"actor_{i}") for i in range(3)]
++        actor_handles[0].setup_root.remote.return_value = root_ref
++        for actor, worker_ref in zip(actor_handles, worker_refs):
++            actor.setup_worker.remote.return_value = worker_ref
++
++        with (
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.placement_group",
++                return_value=fake_pg,
++            ) as mock_pg,
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.GPUShuffleActor"
++            ) as mock_actor_cls,
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.ray.get"
++            ) as mock_ray_get,
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait"
++            ) as mock_ray_wait,
++        ):
++            mock_actor_cls.options.return_value.remote.side_effect = actor_handles
++            mock_ray_get.return_value = [None, None, None]
+             mock_ray_wait.return_value = (worker_refs, [])
+ 
+-            pool.start()
++            pool.activate()
++            mock_pg.assert_called_once_with(
++                bundles=[{"CPU": 1.0, "GPU": 1.0}] * 3,
++                strategy="SPREAD",
++                bundle_label_selector=[{"accelerator": "h100"}] * 3,
++            )
++            assert pool.state is GPURankPoolState.STARTING
++            assert pool.poll_ready()
+ 
+         assert len(pool.actors) == 3
+         assert mock_actor_cls.options.call_count == 3
++        assert pool.state is GPURankPoolState.READY
++        strategies = [
++            call.kwargs["scheduling_strategy"]
++            for call in mock_actor_cls.options.call_args_list
++        ]
++        assert [strategy.placement_group for strategy in strategies] == [fake_pg] * 3
++        assert [strategy.placement_group_bundle_index for strategy in strategies] == [
++            0,
++            1,
++            2,
++        ]
++        for actor in actor_handles:
++            actor.setup_worker.remote.assert_called_once_with(root_ref)
++
++    def test_setup_timeout_cleans_up_placement_group(self):
++        pool = self._make_pool(nranks=2)
++        fake_pg = MagicMock()
++        fake_pg.ready.return_value = MagicMock()
++
++        with (
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.placement_group",
++                return_value=fake_pg,
++            ),
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.remove_placement_group"
++            ) as mock_remove,
++            patch("ray.data._internal.gpu_shuffle.hash_shuffle.GPUShuffleActor"),
++        ):
++            pool.activate()
++            pool._setup_start_time = hash_shuffle.time.perf_counter() - 61
++            with pytest.raises(TimeoutError, match="placement-group and UCXX setup"):
++                pool.poll_ready()
++
++        mock_remove.assert_called_once_with(fake_pg)
++        assert pool.state is GPURankPoolState.FAILED
++
++    def test_setup_failure_cleans_up_every_rank_and_placement_group(self):
++        pool = self._make_pool(nranks=2)
++        fake_pg = MagicMock()
++        worker_refs = [MagicMock(name=f"worker_{rank}") for rank in range(2)]
++        actors = [MagicMock(name=f"actor_{rank}") for rank in range(2)]
++        failure = RuntimeError("rank setup failed")
++        pool._placement_group = fake_pg
++        pool._actors = actors
++        pool._worker_setup_refs = worker_refs
++        pool._setup_start_time = hash_shuffle.time.perf_counter()
++        pool._state = GPURankPoolState.STARTING
++
++        with (
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.ray.wait",
++                return_value=(worker_refs, []),
++            ),
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.ray.get",
++                side_effect=failure,
++            ),
++            patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill") as mock_kill,
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.remove_placement_group"
++            ) as mock_remove,
++        ):
++            with pytest.raises(RuntimeError, match="rank setup failed"):
++                pool.poll_ready()
++
++        assert mock_kill.call_count == 2
++        mock_remove.assert_called_once_with(fake_pg)
++        assert pool.actors == []
++        assert pool._placement_group is None
++        assert pool.state is GPURankPoolState.FAILED
+ 
+     def test_get_actor_for_block_round_robin(self):
+         pool = self._make_pool(nranks=3)
+         mock_actors = [MagicMock(name=f"actor_{i}") for i in range(3)]
+         pool._actors = mock_actors
++        pool._state = GPURankPoolState.READY
+ 
+         # Blocks 0,1,2,3,4 should map to actors 0,1,2,0,1
+         expected = [mock_actors[i % 3] for i in range(5)]
+@@ -250,14 +343,15 @@ class TestGPURankPool:
+         assert pool.actors == []
+         assert pool.is_shutdown
+ 
+-    def test_shutdown_without_force_clears_actors(self):
++    def test_shutdown_without_force_still_terminates_rank_gang(self):
+         pool = self._make_pool(nranks=2)
+         pool._actors = [MagicMock(), MagicMock()]
++        pool._state = GPURankPoolState.READY
+ 
+         with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill") as mock_kill:
+             pool.shutdown(force=False)
+ 
+-        mock_kill.assert_not_called()
++        assert mock_kill.call_count == 2
+         assert pool.actors == []
+         assert pool.is_shutdown
+ 
+@@ -301,32 +395,70 @@ class TestGPUShuffleOperatorConstructor:
+         op = self._make_op(num_partitions=None, nranks=4, default_parallelism=200)
+         assert op._num_partitions == 200
+ 
+-    def test_base_resource_usage_is_nranks_gpus(self):
++    def test_resource_requirements_are_complete_fixed_rank_gang(self):
+         op = self._make_op(nranks=6, num_partitions=6)
+-        usage = op.base_resource_usage
+-        assert usage.gpu == 6
+-
+-    def test_current_logical_usage_reserves_nranks_before_pool_start(self):
+-        """Empty actor list before start must still reserve configured GPUs."""
++        assert op.base_resource_usage == ExecutionResources(cpu=6, gpu=6)
++        minimum, maximum = op.min_max_resource_requirements()
++        assert minimum == ExecutionResources(cpu=6, gpu=6)
++        assert maximum.cpu == maximum.gpu == 6
++        assert maximum.memory == 0
++        assert maximum.object_store_memory == float("inf")
++
++    def test_current_logical_usage_is_zero_before_admission(self):
+         op = self._make_op(nranks=5, num_partitions=5)
+-        assert op.current_logical_usage().gpu == 5
++        assert op.current_logical_usage().gpu == 0
+ 
+-    def test_current_logical_usage_matches_len_actors_when_running(self):
++    def test_current_logical_usage_is_full_gang_while_reserved(self):
+         op = self._make_op(nranks=4, num_partitions=4)
+-        op._rank_pool._actors = [MagicMock() for _ in range(4)]
++        op._rank_pool._state = GPURankPoolState.RESERVING
+         assert op.current_logical_usage().gpu == 4
++        assert op.current_logical_usage().cpu == 4
+ 
+     def test_current_logical_usage_zero_after_pool_shutdown(self):
+-        """Early actor release must drop logical GPU usage for the scheduler."""
+         op = self._make_op(nranks=4, num_partitions=4)
+         op._rank_pool._actors = [MagicMock() for _ in range(4)]
+-        op._rank_pool.shutdown(force=False)
++        op._rank_pool._state = GPURankPoolState.READY
++        with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill"):
++            op._rank_pool.shutdown(force=False)
+         assert op.current_logical_usage().gpu == 0
+ 
+-    def test_incremental_resource_usage_is_one_gpu(self):
++    def test_resource_admission_spec_is_fixed_complete_gang(self):
++        op = self._make_op(nranks=4, num_partitions=4)
++        spec = op.resource_admission_spec()
++
++        assert spec.kind is AdmissionKind.FIXED_GANG
++        assert spec.max_units == 1
++        assert spec.unit_bundle is None
++        assert spec.sticky_after_start
++        assert len(spec.minimum_bundles) == 4
++        assert all(bundle.resources.cpu == 1 for bundle in spec.minimum_bundles)
++        assert all(bundle.resources.gpu == 1 for bundle in spec.minimum_bundles)
++
++    def test_start_does_not_acquire_resources_without_grant(self):
++        op = self._make_op()
++        with patch.object(op._rank_pool, "activate") as mock_activate:
++            op.start(ExecutionOptions(), noop_counter())
++        mock_activate.assert_not_called()
++
++    def test_disabled_resource_admission_uses_legacy_activation(self):
+         op = self._make_op()
+-        usage = op.incremental_resource_usage()
+-        assert usage.gpu == 1
++        op.data_context._enable_resource_admission_control = False
++        assert op.resource_admission_spec() is None
++        with patch.object(op._rank_pool, "activate") as mock_activate:
++            op.start(ExecutionOptions(), noop_counter())
++        mock_activate.assert_called_once()
++
++    def test_grant_before_start_activates_only_after_start(self):
++        op = self._make_op()
++        with patch.object(op._rank_pool, "activate") as mock_activate:
++            op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=1))
++            mock_activate.assert_not_called()
++            op.start(ExecutionOptions(), noop_counter())
++        mock_activate.assert_called_once()
++
++    def test_incremental_resource_usage_is_complete_rank_bundle(self):
++        op = self._make_op()
++        assert op.incremental_resource_usage() == ExecutionResources(cpu=1, gpu=1)
+ 
+     def test_progress_bar_names(self):
+         op = self._make_op()
+@@ -372,6 +504,7 @@ class TestGPUShuffleOperatorInputRouting:
+             actor.insert_batch.remote.return_value = MagicMock()
+         op._rank_pool._actors = mock_actors
+         op._rank_pool._nranks = nranks
++        op._rank_pool._state = GPURankPoolState.READY
+         return op, mock_actors
+ 
+     def test_single_block_routed_to_first_actor(self):
+@@ -414,6 +547,28 @@ class TestGPUShuffleOperatorInputRouting:
+         task._task_done_callback()
+         assert 0 not in op._insert_tasks
+ 
++    def test_idle_gang_can_be_revoked_before_first_input(self):
++        op, _ = self._make_op_with_mock_pool(nranks=2)
++        op._admission_grant = ResourceAdmissionGrant(max_units=1)
++
++        with patch.object(op._rank_pool, "deactivate") as mock_deactivate:
++            op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++
++        mock_deactivate.assert_called_once()
++        assert op._admission_grant.max_units == 0
++
++    def test_gang_is_sticky_after_first_input(self):
++        op, _ = self._make_op_with_mock_pool(nranks=2)
++        op._admission_grant = ResourceAdmissionGrant(max_units=1)
++        op._add_input_inner(_make_bundle(1), 0)
++
++        with patch.object(op._rank_pool, "deactivate") as mock_deactivate:
++            op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++
++        mock_deactivate.assert_not_called()
++        assert op._admission_grant.max_units == 1
++        assert not op.can_release_resource_admission()
++
+ 
+ # ---------------------------------------------------------------------------
+ # GPUShuffleOperator: finalization and completion
+@@ -434,6 +589,7 @@ class TestGPUShuffleOperatorFinalization:
+             )
+         op._rank_pool._actors = mock_actors
+         op._rank_pool._nranks = nranks
++        op._rank_pool._state = GPURankPoolState.READY
+         op._block_ref_counter = noop_counter()
+         return op, mock_actors
+ 
+@@ -482,6 +638,70 @@ class TestGPUShuffleOperatorFinalization:
+         for actor in mock_actors:
+             assert actor.finish_and_extract.options.call_count == 1
+ 
++    def test_successful_extraction_releases_sticky_gang(self):
++        op, _ = self._make_op(nranks=2)
++        op._next_block_idx = 1
++        op._inputs_complete = True
++
++        with patch.object(op._reduce_metrics, "on_task_submitted"):
++            op._try_finalize()
++
++        callbacks = [
++            task._task_done_callback for task in list(op._extraction_tasks.values())
++        ]
++        with patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill"):
++            for callback in callbacks:
++                callback(None, None, None)
++
++        assert op.can_release_resource_admission()
++        assert op._rank_pool.state is GPURankPoolState.CLOSED
++
++    def test_empty_input_finalization_cannot_be_revoked(self):
++        op, _ = self._make_op(nranks=2)
++        op._admission_grant = ResourceAdmissionGrant(max_units=1)
++        op._inputs_complete = True
++
++        with patch.object(op._reduce_metrics, "on_task_submitted"):
++            op._try_finalize()
++
++        assert op._finalization_started
++        assert op._next_block_idx == 0
++        assert not op.can_release_resource_admission()
++
++        with patch.object(op._rank_pool, "deactivate") as mock_deactivate:
++            op.apply_resource_admission_grant(ResourceAdmissionGrant(max_units=0))
++
++        mock_deactivate.assert_not_called()
++        assert op._admission_grant.max_units == 1
++
++    def test_extraction_failure_fails_and_cleans_up_complete_gang(self):
++        op, actors = self._make_op(nranks=2)
++        expected_actor_count = len(actors)
++        fake_pg = MagicMock()
++        op._rank_pool._placement_group = fake_pg
++        op._next_block_idx = 1
++        op._inputs_complete = True
++
++        with patch.object(op._reduce_metrics, "on_task_submitted"):
++            op._try_finalize()
++
++        failure = RuntimeError("rank extraction failed")
++        failed_callback = op._extraction_tasks[0]._task_done_callback
++        with (
++            patch("ray.data._internal.gpu_shuffle.hash_shuffle.ray.kill") as mock_kill,
++            patch(
++                "ray.data._internal.gpu_shuffle.hash_shuffle.remove_placement_group"
++            ) as mock_remove,
++        ):
++            failed_callback(failure, None, None)
++
++        assert mock_kill.call_count == expected_actor_count
++        mock_remove.assert_called_once_with(fake_pg)
++        assert op.can_release_resource_admission()
++        assert op._rank_pool.actors == []
++        assert op._rank_pool._placement_group is None
++        assert op._rank_pool.state is GPURankPoolState.FAILED
++
+     def test_has_next_false_initially(self):
+         op, _ = self._make_op()
+         op._inputs_complete = False
+@@ -558,6 +778,13 @@ class TestGPUShuffleOperatorFinalization:
+         assert extract_task in active
+         assert len(active) == 2
+ 
++    def test_pending_rank_setup_refs_are_active_tasks(self):
++        op, _ = self._make_op()
++        setup_refs = [MagicMock(name=f"setup_{rank}") for rank in range(2)]
++        op._rank_pool._worker_setup_refs = setup_refs
++
++        assert [task.get_waitable() for task in op.get_active_tasks()] == setup_refs
++
+     def test_shutdown_clears_tasks_and_kills_actors(self):
+         op, mock_actors = self._make_op(nranks=2)
+         op._insert_tasks[0] = MagicMock()
+@@ -709,6 +936,12 @@ def ray_with_gpu():
+     """
+     pytest.importorskip("cudf", reason="cudf (GPU DataFrame library) not installed")
+     pytest.importorskip("rapidsmpf", reason="rapidsmpf not installed")
++    cupy = pytest.importorskip("cupy", reason="cupy not installed")
++    try:
++        if cupy.cuda.runtime.getDeviceCount() < 1:
++            pytest.skip("No CUDA GPU is visible")
++    except Exception as exc:
++        pytest.skip(f"CUDA driver is unavailable: {exc}")
+ 
+     if not ray.is_initialized():
+         ray.init()
+@@ -741,7 +974,7 @@ class TestGPUShuffleActorReal:
+             total_nparts=total_nparts,
+             key_columns=key_columns,
+         )
+-        _, root_address = ray.get(actor.setup_root.remote())
++        root_address = ray.get(actor.setup_root.remote())
+         ray.get(actor.setup_worker.remote(root_address))
+         return actor
+ 
+@@ -754,13 +987,12 @@ class TestGPUShuffleActorReal:
+         )
+         ray.kill(actor)
+ 
+-    def test_setup_root_returns_rank_and_address(self, ray_with_gpu):
+-        """setup_root() returns a (rank, address_bytes) tuple for UCXX setup."""
++    def test_setup_root_returns_address(self, ray_with_gpu):
++        """setup_root() returns the address bytes needed for UCXX setup."""
+         actor = GPUShuffleActor.options(num_gpus=1).remote(
+             nranks=1, total_nparts=1, key_columns=["k"]
+         )
+-        rank, addr = ray.get(actor.setup_root.remote())
+-        assert isinstance(rank, int)
++        addr = ray.get(actor.setup_root.remote())
+         assert isinstance(addr, bytes)
+         assert len(addr) > 0
+         ray.kill(actor)
+@@ -852,7 +1084,7 @@ class TestGPUSingleRankRoundtrip:
+             total_nparts=total_nparts,
+             key_columns=key_columns,
+         )
+-        _, root_address = ray.get(actor.setup_root.remote())
++        root_address = ray.get(actor.setup_root.remote())
+         ray.get(actor.setup_worker.remote(root_address))
+         ray.get(actor.insert_batch.remote(table))
+         return actor
+@@ -885,7 +1117,7 @@ class TestGPUSingleRankRoundtrip:
+         actor = GPUShuffleActor.options(num_gpus=1).remote(
+             nranks=1, total_nparts=2, key_columns=["k"]
+         )
+-        _, root_address = ray.get(actor.setup_root.remote())
++        root_address = ray.get(actor.setup_root.remote())
+         ray.get(actor.setup_worker.remote(root_address))
+ 
+         batch_sizes = [4, 6, 10]
+@@ -965,26 +1197,23 @@ class TestGPURankPoolReal:
+             log_label="GPUShufflePool",
+         )
+ 
+-    def test_pool_start_creates_actors(self, ray_with_gpu):
+-        """GPURankPool.start() creates the expected number of actors."""
+-        pool = self._make_pool(nranks=1)
+-        pool.start()
+-        assert len(pool.actors) == 1
+-        pool.shutdown(force=True)
++    @staticmethod
++    def _activate_and_wait(pool: GPURankPool) -> None:
++        pool.activate()
++        while not pool.poll_ready():
++            time.sleep(0.01)
+ 
+     def test_pool_shutdown_clears_actors(self, ray_with_gpu):
+         """GPURankPool.shutdown(force=True) kills actors and empties the list."""
+         pool = self._make_pool(nranks=1)
+-        pool.start()
++        self._activate_and_wait(pool)
+         pool.shutdown(force=True)
+         assert pool.actors == []
+ 
+-    def test_pool_actors_respond_after_start(self, ray_with_gpu):
+-        """Actors returned by the pool respond to remote calls after start()."""
++    def test_pool_actors_respond_after_activation(self, ray_with_gpu):
+         pool = self._make_pool(nranks=1, total_nparts=1)
+-        pool.start()
++        self._activate_and_wait(pool)
+         actor = pool.actors[0]
+-        # Actor is fully set up by pool.start(); insert_batch should work immediately
+         table = pa.table({"id": [1], "v": [2]})
+         ray.get(actor.insert_batch.remote(table))
+         pool.shutdown(force=True)
+@@ -1016,6 +1245,182 @@ class TestGPUHashShuffle:
+         assert ds.num_blocks() == max(num_blocks, num_gpus)
+         assert ds.count() == num_rows
+ 
++    def test_one_gpu_actor_shuffle_map_groups_handoff(self, ray_with_gpu):
++        class AddOne:
++            def __call__(self, batch):
++                result = batch.copy(deep=True)
++                result["value"] = result["value"] + 1
++                return result
++
++        class SumGroup:
++            def __call__(self, batch):
++                result = batch.iloc[:1].copy(deep=True)
++                result["value"] = batch["value"].sum()
++                return result[["key", "value"]]
++
++        class AddHundred:
++            def __call__(self, batch):
++                result = batch.copy(deep=True)
++                result["value"] = result["value"] + 100
++                return result
++
++        ctx = DataContext.get_current()
++        old_strategy = ctx.shuffle_strategy
++        old_rank_count = ctx.gpu_shuffle_num_actors
++        old_limits = ctx.execution_options.resource_limits
++        ctx.shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
++        ctx.gpu_shuffle_num_actors = 1
++        ctx.execution_options.resource_limits = ExecutionResources.for_limits(gpu=1)
++
++        try:
++            ds = (
++                ray.data.from_items(
++                    [
++                        {"key": 0, "value": 1},
++                        {"key": 0, "value": 2},
++                        {"key": 0, "value": 3},
++                        {"key": 1, "value": 4},
++                        {"key": 1, "value": 5},
++                        {"key": 1, "value": 6},
++                    ],
++                    override_num_blocks=2,
++                )
++                .map_batches(
++                    AddOne,
++                    batch_format="cudf",
++                    compute=ActorPoolStrategy(size=1),
++                    num_cpus=0,
++                    num_gpus=1,
++                )
++                .groupby("key", num_partitions=1)
++                .map_groups(
++                    SumGroup,
++                    batch_format="cudf",
++                    compute=ActorPoolStrategy(size=1),
++                    num_cpus=0,
++                    num_gpus=1,
++                )
++                .map_batches(
++                    AddHundred,
++                    batch_format="cudf",
++                    compute=ActorPoolStrategy(size=1),
++                    num_cpus=0,
++                    num_gpus=1,
++                )
++            )
++
++            physical_plan, _ = get_execution_plan(ds._logical_plan)
++            stack = [physical_plan.dag]
++            actor_ops = []
++            shuffle_ops = []
++            while stack:
++                op = stack.pop()
++                if isinstance(op, ActorPoolMapOperator):
++                    actor_ops.append(op)
++                if isinstance(op, GPUShuffleOperator):
++                    shuffle_ops.append(op)
++                stack.extend(op.input_dependencies)
++
++            assert len(actor_ops) == 3, physical_plan.dag.dag_str
++            assert len(shuffle_ops) == 1, physical_plan.dag.dag_str
++            assert all(
++                op.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
++                for op in actor_ops
++            )
++            assert (
++                shuffle_ops[0].resource_admission_spec().kind
++                is AdmissionKind.FIXED_GANG
++            )
++
++            assert sorted(ds.take_all(), key=lambda row: row["key"]) == [
++                {"key": 0, "value": 109},
++                {"key": 1, "value": 118},
++            ]
++
++            total_gpus = ray.cluster_resources()["GPU"]
++            for _ in range(100):
++                if ray.available_resources().get("GPU", 0) >= total_gpus:
++                    break
++                time.sleep(0.05)
++            assert ray.available_resources().get("GPU", 0) >= total_gpus
++        finally:
++            ctx.shuffle_strategy = old_strategy
++            ctx.gpu_shuffle_num_actors = old_rank_count
++            ctx.execution_options.resource_limits = old_limits
++
++    def test_one_gpu_actor_shuffle_map_groups_handoff_with_spilling(
++        self, shutdown_only, tmp_path
++    ):
++        pytest.importorskip("cudf")
++        pytest.importorskip("rapidsmpf")
++        cupy = pytest.importorskip("cupy")
++        try:
++            if cupy.cuda.runtime.getDeviceCount() < 1:
++                pytest.skip("No CUDA GPU is visible")
++        except Exception as exc:
++            pytest.skip(f"CUDA driver is unavailable: {exc}")
++
++        class AddKey:
++            def __call__(self, batch):
++                result = batch.copy(deep=True)
++                result["key"] = result["id"] % 64
++                return result
++
++        class SumGroup:
++            def __call__(self, batch):
++                result = batch.iloc[:1].copy(deep=True)
++                result["id"] = batch["id"].sum()
++                return result[["key", "id"]]
++
++        class Identity:
++            def __call__(self, batch):
++                return batch
++
++        ray.shutdown()
++        ray.init(
++            num_cpus=4,
++            num_gpus=1,
++            object_store_memory=100e6,
++            object_spilling_directory=str(tmp_path),
++            include_dashboard=False,
++        )
++        ctx = DataContext.get_current()
++        ctx.shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
++        ctx.gpu_shuffle_num_actors = 1
++        ctx.execution_options.resource_limits = ExecutionResources.for_limits(gpu=1)
++        ctx.enable_get_object_locations_for_metrics = True
++
++        num_rows = 16_000_000
++        ds = (
++            ray.data.range(num_rows, override_num_blocks=8)
++            .map_batches(
++                AddKey,
++                batch_format="cudf",
++                compute=ActorPoolStrategy(size=1),
++                num_cpus=0,
++                num_gpus=1,
++            )
++            .groupby("key", num_partitions=1)
++            .map_groups(
++                SumGroup,
++                batch_format="cudf",
++                compute=ActorPoolStrategy(size=1),
++                num_cpus=0,
++                num_gpus=1,
++            )
++            .map_batches(
++                Identity,
++                batch_format="cudf",
++                compute=ActorPoolStrategy(size=1),
++                num_cpus=0,
++                num_gpus=1,
++            )
++        )
++
++        materialized = ds.materialize()
++        assert materialized.count() == 64
++        assert materialized.get_stats_summary().global_bytes_spilled > 0
++
+ 
+ if __name__ == "__main__":
+     import sys
+diff --git a/python/ray/data/tests/test_map_operator.py b/python/ray/data/tests/test_map_operator.py
+index 09df9e0f43..c90db77fdf 100644
+--- a/python/ray/data/tests/test_map_operator.py
++++ b/python/ray/data/tests/test_map_operator.py
+@@ -381,9 +381,11 @@ def test_map_operator_disable_block_shaping_with_batches(
+ 
+ 
+ @pytest.mark.parametrize("use_actors", [False, True])
+-def test_map_operator_ray_args(shutdown_only, use_actors):
++def test_map_operator_ray_args(shutdown_only, restore_data_context, use_actors):
+     ray.shutdown()
+     ray.init(num_cpus=0, num_gpus=1)
++    # This directly drives an operator without StreamingExecutor/ResourceManager.
++    DataContext.get_current()._enable_resource_admission_control = False
+     # Create with inputs.
+     input_op = InputDataBuffer(
+         DataContext.get_current(), make_ref_bundles([[i] for i in range(10)])
+@@ -425,9 +427,11 @@ def test_map_operator_ray_args(shutdown_only, use_actors):
+ 
+ 
+ @pytest.mark.parametrize("use_actors", [False, True])
+-def test_map_operator_shutdown(shutdown_only, use_actors):
++def test_map_operator_shutdown(shutdown_only, restore_data_context, use_actors):
+     ray.shutdown()
+     ray.init(num_cpus=0, num_gpus=1)
++    # This directly drives an operator without StreamingExecutor/ResourceManager.
++    DataContext.get_current()._enable_resource_admission_control = False
+ 
+     def _sleep(block_iter: Iterable[Block]) -> Iterable[Block]:
+         time.sleep(999)
+diff --git a/python/ray/data/tests/test_reservation_based_resource_allocator.py b/python/ray/data/tests/test_reservation_based_resource_allocator.py
+index 61708833d7..68bf36c39e 100644
+--- a/python/ray/data/tests/test_reservation_based_resource_allocator.py
++++ b/python/ray/data/tests/test_reservation_based_resource_allocator.py
+@@ -278,6 +278,9 @@ class TestReservationOpResourceAllocator:
+     def test_reserve_min_resources_for_gpu_ops(self, restore_data_context):
+         """Test that we'll reserve enough resources for ActorPoolMapOperator
+         that uses GPU."""
++        # This test exercises the legacy allocator formula directly, without an
++        # executor demand/admission cycle.
++        DataContext.get_current()._enable_resource_admission_control = False
+         global_limits = ExecutionResources(cpu=6, gpu=8, object_store_memory=1600)
+ 
+         o1 = InputDataBuffer(DataContext.get_current(), [])
+@@ -286,6 +289,7 @@ class TestReservationOpResourceAllocator:
+             ray_remote_args={"num_cpus": 0, "num_gpus": 1},
+             compute_strategy=ray.data.ActorPoolStrategy(size=8),
+         )
++        o2.start = MagicMock()
+         # Mock min_max_resource_requirements to return a minimum of 800 bytes
+         # (simulating 8 actors * 100 bytes per pending output)
+         o2.min_max_resource_requirements = MagicMock(
+@@ -758,6 +762,9 @@ class TestReservationOpResourceAllocator:
+         """
+         DataContext.get_current().op_resource_reservation_enabled = True
+         DataContext.get_current().op_resource_reservation_ratio = 0.5
++        # This is a stock reservation-budget test with mocked usage, not an
++        # admission-controller lifecycle test.
++        DataContext.get_current()._enable_resource_admission_control = False
+ 
+         # Build pipeline: Input -> Read -> Preprocess -> Infer(GPU) -> Write
+         # This mirrors the production pipeline structure
+@@ -770,6 +777,7 @@ class TestReservationOpResourceAllocator:
+             compute_strategy=ray.data.ActorPoolStrategy(min_size=1, max_size=4),
+             name="Infer",
+         )
++        o4.start = MagicMock()
+         o5 = mock_map_op(o4, ray_remote_args={"num_cpus": 1}, name="Write")
+ 
+         topo = build_streaming_topology(o5, ExecutionOptions(), noop_counter())
+diff --git a/python/ray/data/tests/test_resource_manager.py b/python/ray/data/tests/test_resource_manager.py
+index cdc85358c1..db4d212e5f 100644
+--- a/python/ray/data/tests/test_resource_manager.py
++++ b/python/ray/data/tests/test_resource_manager.py
+@@ -28,8 +28,17 @@ from ray.data._internal.execution.operators.join import JoinOperator
+ from ray.data._internal.execution.operators.limit_operator import LimitOperator
+ from ray.data._internal.execution.operators.map_operator import MapOperator
+ from ray.data._internal.execution.operators.union_operator import UnionOperator
++from ray.data._internal.execution.resource_admission import (
++    AdmissionBundle,
++    AdmissionKind,
++    ResourceAdmissionGrant,
++    ResourceAdmissionSpec,
++    ResourceAdmissionState,
++)
+ from ray.data._internal.execution.resource_manager import (
++    ReservationOpResourceAllocator,
+     ResourceManager,
++    _ResourceAdmissionController,
+     create_resource_allocator,
+ )
+ from ray.data._internal.execution.streaming_executor_state import (
+@@ -94,6 +103,608 @@ def mock_join_op(left_input_op, right_input_op):
+     return op
+ 
+ 
++def _mock_resource_admission_op(
++    *,
++    inputs=(),
++    completed=False,
++    internal_demand=False,
++    inputs_complete=False,
++    cpu=1,
++    gpu=1,
++    memory=0,
++    custom_resources=(),
++    label_selector=(),
++    kind=AdmissionKind.ELASTIC_POOL,
++    minimum_bundles=1,
++    max_units=4,
++    sticky=False,
++):
++    op = MagicMock()
++    op.input_dependencies = list(inputs)
++    op._inputs_complete = inputs_complete
++    op.has_execution_finished = MagicMock(return_value=completed)
++    op.has_internal_admission_demand = MagicMock(return_value=internal_demand)
++    op.can_release_resource_admission = MagicMock(return_value=True)
++    op.num_active_tasks = MagicMock(return_value=0)
++    op.current_logical_usage = MagicMock(return_value=ExecutionResources.zero())
++    op.pending_logical_usage = MagicMock(return_value=ExecutionResources.zero())
++    bundle = AdmissionBundle(
++        resources=ExecutionResources(cpu=cpu, gpu=gpu, memory=memory),
++        custom_resources=custom_resources,
++        label_selector=label_selector,
++    )
++    op.resource_admission_spec = MagicMock(
++        return_value=ResourceAdmissionSpec(
++            kind=kind,
++            minimum_bundles=(bundle,) * minimum_bundles,
++            unit_bundle=None if kind is AdmissionKind.FIXED_GANG else bundle,
++            max_units=1 if kind is AdmissionKind.FIXED_GANG else max_units,
++            sticky_after_start=sticky,
++        )
++    )
++    op.min_scheduling_resources = MagicMock(return_value=bundle.resources)
++    return op
++
++
++def _mock_admission_resource_manager(limits: ExecutionResources) -> MagicMock:
++    return MagicMock(
++        _options=ExecutionOptions(),
++        get_global_limits=MagicMock(return_value=limits),
++        get_allocation_target=MagicMock(return_value=None),
++    )
++
++
++def _mock_allocator_op(minimum, maximum):
++    op = MagicMock()
++    op.throttling_disabled.return_value = False
++    op.has_execution_finished.return_value = False
++    op.min_max_resource_requirements.return_value = (minimum, maximum)
++    op.min_scheduling_resources.return_value = minimum
++    return op
++
++
++def test_resource_admission_topological_frontier():
++    upstream = _mock_resource_admission_op()
++    completed_cpu_middle = MagicMock(
++        spec=PhysicalOperator, input_dependencies=[upstream]
++    )
++    completed_cpu_middle.resource_admission_spec.return_value = None
++    completed_cpu_middle.min_scheduling_resources.return_value = (
++        ExecutionResources.zero()
++    )
++    downstream = _mock_resource_admission_op(inputs=[completed_cpu_middle])
++    last = _mock_resource_admission_op(inputs=[downstream])
++    upstream.has_completed.side_effect = AssertionError("must not call has_completed")
++    upstream.has_next.side_effect = AssertionError("must not call has_next")
++    states = {
++        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++        last: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=1)
++    )
++
++    controller = _ResourceAdmissionController(states, resource_manager)
++    controller.update_states()
++    controller.update_grants()
++
++    # Downstream demand protects its unfinished GPU ancestor. With one GPU, the
++    # ancestor is admitted, the first non-fitting claimant is the frontier, and
++    # later claimants cannot leapfrog it.
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(downstream) is ResourceAdmissionState.FRONTIER
++    assert controller.get_state(last) is ResourceAdmissionState.BLOCKED
++
++    # Once the ancestor is complete, the downstream stages advance without
++    # waiting for every non-GPU intermediate to remain unfinished.
++    upstream.has_execution_finished.return_value = True
++    controller.update_states()
++    controller.update_grants()
++    assert controller.get_state(upstream) is ResourceAdmissionState.DORMANT
++    assert controller.get_state(downstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(last) is ResourceAdmissionState.FRONTIER
++    upstream.has_completed.assert_not_called()
++    upstream.has_next.assert_not_called()
++    upstream.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=0)
++    )
++
++
++def test_resource_admission_streams_when_all_claims_fit():
++    upstream = _mock_resource_admission_op()
++    downstream = _mock_resource_admission_op(inputs=[upstream])
++    states = {
++        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=2)
++    )
++
++    controller = _ResourceAdmissionController(states, resource_manager)
++    controller.update_states()
++    resource_manager.get_allocation_target.return_value = None
++    controller.update_grants()
++
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(downstream) is ResourceAdmissionState.ADMITTED
++
++
++@pytest.mark.parametrize(
++    "bundle_kwargs",
++    [
++        {"custom_resources": (("accelerator_type:L4", 1.0),)},
++        {"label_selector": (("gpu_type", "L4"),)},
++    ],
++)
++def test_constrained_admission_bundle_serializes_claimants(bundle_kwargs):
++    constrained = _mock_resource_admission_op(gpu=0.5, **bundle_kwargs)
++    unconstrained = _mock_resource_admission_op(gpu=0.5)
++    states = {
++        constrained: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++        unconstrained: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=1)
++    )
++
++    controller = _ResourceAdmissionController(states, resource_manager)
++    controller.update_states()
++    resource_manager.get_allocation_target.return_value = None
++    controller.update_grants()
++
++    # Aggregate CPU/GPU capacity fits both floors, but custom resources and node
++    # labels cannot be represented by ExecutionResources. Conservatively admit
++    # one complete owner at a time instead of risking an unplaceable claimant.
++    assert controller.get_state(constrained) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(unconstrained) is ResourceAdmissionState.FRONTIER
++    assert controller.get_grant(constrained) == ResourceAdmissionGrant(max_units=1)
++    assert controller.get_grant(unconstrained) == ResourceAdmissionGrant(max_units=0)
++
++
++def test_non_releasable_custom_only_owner_remains_a_claimant():
++    owner = _mock_resource_admission_op(
++        cpu=0,
++        gpu=0,
++        custom_resources=(("custom_gpu", 1.0),),
++        inputs_complete=True,
++    )
++    owner.can_release_resource_admission.return_value = False
++    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    resource_manager = _mock_admission_resource_manager(ExecutionResources.zero())
++
++    controller = _ResourceAdmissionController(states, resource_manager)
++    controller.update_states()
++    controller.update_grants()
++
++    assert controller.get_state(owner) is ResourceAdmissionState.ADMITTED
++    assert controller.get_grant(owner) == ResourceAdmissionGrant(max_units=1)
++
++
++def test_elastic_demotion_revokes_submission_grant_while_active_work_drains():
++    owner = _mock_resource_admission_op(internal_demand=True)
++    states = {owner: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=1, gpu=1)
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states()
++    controller.update_grants()
++    assert controller.get_grant(owner) == ResourceAdmissionGrant(max_units=1)
++
++    owner.can_release_resource_admission.return_value = False
++    controller.update_states(ExecutionResources.zero())
++    controller.update_grants()
++
++    # Elastic owners accept a zero-unit grant immediately so internally queued
++    # work cannot start after demotion. Their finite active calls keep running
++    # and release the physical resource through the autoscaler drain path.
++    expected = ResourceAdmissionGrant(max_units=0)
++    assert controller.get_grant(owner) == expected
++    assert owner.apply_resource_admission_grant.call_args.args == (expected,)
++    assert owner.apply_resource_admission_grant.call_count == 3
++
++
++def test_resource_admission_releases_drained_ancestor_with_buffered_output():
++    upstream = _mock_resource_admission_op(inputs_complete=True)
++    upstream.current_logical_usage.return_value = ExecutionResources(gpu=1)
++    downstream = _mock_resource_admission_op(inputs=[upstream])
++    states = {
++        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=1)
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states()
++    controller.update_grants()
++
++    assert not upstream.has_execution_finished()
++    assert controller.get_state(upstream) is ResourceAdmissionState.DORMANT
++    assert controller.get_state(downstream) is ResourceAdmissionState.ADMITTED
++    upstream.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=0)
++    )
++
++
++def test_resource_admission_fan_in_does_not_leapfrog():
++    left = _mock_resource_admission_op(gpu=0.5)
++    right = _mock_resource_admission_op(gpu=1)
++    fan_in = MagicMock(spec=PhysicalOperator, input_dependencies=[left, right])
++    downstream = _mock_resource_admission_op(inputs=[fan_in], gpu=0.5)
++    states = {
++        left: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++        right: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=1)
++    )
++
++    controller = _ResourceAdmissionController(states, resource_manager)
++    controller.update_states()
++
++    assert controller.get_state(left) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(right) is ResourceAdmissionState.FRONTIER
++    assert controller.get_state(downstream) is ResourceAdmissionState.BLOCKED
++
++
++def test_resource_admission_aggregates_fixed_gang_bundles():
++    gang = _mock_resource_admission_op(
++        kind=AdmissionKind.FIXED_GANG,
++        minimum_bundles=2,
++        internal_demand=True,
++    )
++    states = {gang: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=2, gpu=1)
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states()
++    controller.update_grants()
++    assert controller.get_state(gang) is ResourceAdmissionState.FRONTIER
++    gang.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=1)
++    )
++
++    controller.update_states(ExecutionResources(cpu=2, gpu=2))
++    controller.update_grants()
++    assert controller.get_state(gang) is ResourceAdmissionState.ADMITTED
++    gang.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=1)
++    )
++
++
++def test_fixed_gang_waits_for_upstream_handoff_without_reserving_early():
++    upstream = _mock_resource_admission_op(internal_demand=True)
++    gang = _mock_resource_admission_op(
++        inputs=[upstream],
++        kind=AdmissionKind.FIXED_GANG,
++        minimum_bundles=1,
++        internal_demand=True,
++    )
++    states = {
++        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++        gang: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=1)
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states()
++    controller.update_grants()
++
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(gang) is ResourceAdmissionState.FRONTIER
++    gang.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=0)
++    )
++
++
++def test_admission_floor_exceeding_explicit_limits_fails_fast():
++    gang = _mock_resource_admission_op(
++        kind=AdmissionKind.FIXED_GANG,
++        minimum_bundles=2,
++        internal_demand=True,
++    )
++    states = {gang: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    resource_manager = MagicMock(
++        _options=ExecutionOptions(
++            resource_limits=ExecutionResources.for_limits(cpu=8, gpu=1)
++        )
++    )
++
++    with pytest.raises(
++        ValueError, match="admission floor of 2 bundle.*exceeds the explicit"
++    ):
++        _ResourceAdmissionController(states, resource_manager)
++
++
++def test_fractional_actor_floor_exceeding_explicit_limit_fails_fast():
++    actor = _mock_resource_admission_op(gpu=0.5, internal_demand=True)
++    states = {actor: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    resource_manager = MagicMock(
++        _options=ExecutionOptions(
++            resource_limits=ExecutionResources.for_limits(gpu=0.25)
++        )
++    )
++
++    with pytest.raises(ValueError, match="admission floor.*gpu=0.5"):
++        _ResourceAdmissionController(states, resource_manager)
++
++
++def test_fixed_gang_uses_effective_limit_when_exclusion_is_permitted():
++    gang = _mock_resource_admission_op(
++        kind=AdmissionKind.FIXED_GANG,
++        minimum_bundles=2,
++        internal_demand=True,
++        memory=1,
++    )
++    states = {gang: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
++    options = ExecutionOptions(
++        resource_limits=ExecutionResources.for_limits(cpu=8, memory=2),
++        exclude_resources=ExecutionResources(memory=1),
++    )
++    # ExecutionOptions permits a logical-memory limit and exclusion together.
++    options.validate()
++    resource_manager = MagicMock()
++    resource_manager._options = options
++
++    with pytest.raises(
++        ValueError, match="admission floor of 2 bundle.*effective execution resource"
++    ):
++        _ResourceAdmissionController(states, resource_manager)
++
++
++def test_resource_admission_supports_transient_contract():
++    transient = _mock_resource_admission_op(
++        kind=AdmissionKind.TRANSIENT,
++        internal_demand=True,
++        gpu=0.25,
++        max_units=8,
++    )
++    states = {
++        transient: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=8, gpu=2)
++    )
++    resource_manager.get_allocation_target.return_value = ExecutionResources(
++        cpu=4, gpu=1
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states()
++    controller.update_grants()
++
++    assert controller.get_state(transient) is ResourceAdmissionState.ADMITTED
++    transient.apply_resource_admission_grant.assert_called_with(
++        ResourceAdmissionGrant(max_units=4)
++    )
++
++
++def test_started_sticky_gang_protects_unfinished_admission_ancestors():
++    upstream = _mock_resource_admission_op(internal_demand=True)
++    gang = _mock_resource_admission_op(
++        inputs=[upstream],
++        kind=AdmissionKind.FIXED_GANG,
++        internal_demand=True,
++        sticky=True,
++    )
++    states = {
++        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++        gang: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
++    }
++    resource_manager = _mock_admission_resource_manager(
++        ExecutionResources(cpu=2, gpu=2)
++    )
++    controller = _ResourceAdmissionController(states, resource_manager)
++
++    controller.update_states(ExecutionResources(cpu=2, gpu=2))
++    controller.update_grants()
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(gang) is ResourceAdmissionState.ADMITTED
++
++    gang.can_release_resource_admission.return_value = False
++    controller.update_states(ExecutionResources(cpu=1, gpu=1))
++    controller.update_grants()
++
++    # The gang cannot finish until its producer supplies all remaining input.
++    # Preserve both progress floors even while refreshed capacity is short.
++    assert controller.get_state(upstream) is ResourceAdmissionState.ADMITTED
++    assert controller.get_state(gang) is ResourceAdmissionState.ADMITTED
++    assert controller.get_grant(upstream) == ResourceAdmissionGrant(max_units=1)
++    assert controller.get_grant(gang) == ResourceAdmissionGrant(max_units=1)
++
++
++def test_unadapted_gpu_operator_warns_once_per_controller():
++    op = MagicMock()
++    op.__str__.return_value = "GpuTask"
++    op.resource_admission_spec.return_value = None
++    op._resource_admission_fallback_reason.return_value = None
++    op.min_scheduling_resources.return_value = ExecutionResources(gpu=1)
++    states = {op: MagicMock()}
++
++    with patch(
++        "ray.data._internal.execution.resource_manager.logger.warning"
++    ) as warning:
++        controller = _ResourceAdmissionController(states, MagicMock())
++
++    assert controller.get_state(op) is None
++    warning.assert_called_once()
++    args = warning.call_args.args
++    assert args[1] == "GpuTask"
++    assert "deadlock protection does not apply" in args[0]
++
++
++@pytest.mark.parametrize(
++    "state",
++    [
++        ResourceAdmissionState.DORMANT,
++        ResourceAdmissionState.FRONTIER,
++        ResourceAdmissionState.BLOCKED,
++    ],
++)
++def test_non_admitted_resource_state_blocks_task_submission(state):
++    resource_manager = MagicMock()
++    resource_manager._topology = {}
++    resource_manager.get_resource_admission_state.return_value = state
++    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
++
++    assert not allocator.can_submit_new_task(MagicMock())
++
++
++def test_admitted_resource_floors_precede_default_sharing():
++    gpu_minimum = ExecutionResources(cpu=1, gpu=1)
++    gpu_maximum = ExecutionResources(
++        cpu=4, gpu=4, object_store_memory=float("inf")
++    )
++    upstream_gpu = _mock_allocator_op(gpu_minimum, gpu_maximum)
++    cpu_middle = _mock_allocator_op(ExecutionResources(cpu=1), ExecutionResources.inf())
++    downstream_gpu = _mock_allocator_op(gpu_minimum, gpu_maximum)
++    resource_manager = MagicMock()
++    resource_manager._topology = {
++        upstream_gpu: MagicMock(),
++        cpu_middle: MagicMock(),
++        downstream_gpu: MagicMock(),
++    }
++    resource_manager.get_resource_admission_state.side_effect = lambda op: (
++        ResourceAdmissionState.ADMITTED
++        if op in (upstream_gpu, downstream_gpu)
++        else None
++    )
++    resource_manager.get_resource_admission_minimum_resources.side_effect = lambda op: (
++        ExecutionResources(cpu=1, gpu=1)
++        if op in (upstream_gpu, downstream_gpu)
++        else None
++    )
++    resource_manager.get_mem_op_internal.return_value = 0
++    resource_manager.get_mem_op_outputs.return_value = 0
++    resource_manager.get_op_usage.return_value = ExecutionResources.zero()
++    resource_manager._is_blocking_materializing_op.return_value = False
++    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
++
++    allocator.update_budgets(
++        limits=ExecutionResources(cpu=8, gpu=2, object_store_memory=1_000)
++    )
++
++    assert allocator.get_allocation(upstream_gpu).gpu >= 1
++    assert allocator.get_allocation(downstream_gpu).gpu >= 1
++    assert allocator.get_allocation(cpu_middle).gpu == 0
++
++
++def test_admitted_sticky_floor_tolerates_refreshed_capacity_shortfall():
++    op = _mock_allocator_op(
++        ExecutionResources(cpu=2, gpu=2),
++        ExecutionResources(cpu=2, gpu=2, object_store_memory=float("inf")),
++    )
++    resource_manager = MagicMock()
++    resource_manager._topology = {op: MagicMock()}
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.ADMITTED
++    )
++    resource_manager.get_resource_admission_minimum_resources.return_value = (
++        ExecutionResources(cpu=2, gpu=2)
++    )
++    resource_manager.get_mem_op_internal.return_value = 0
++    resource_manager.get_mem_op_outputs.return_value = 0
++    resource_manager.get_op_usage.return_value = ExecutionResources.zero()
++    resource_manager._is_blocking_materializing_op.return_value = False
++    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
++
++    allocator.update_budgets(
++        limits=ExecutionResources(cpu=1, gpu=1, object_store_memory=1_000)
++    )
++
++    assert allocator.get_allocation(op).gpu >= 2
++
++
++def test_resource_admission_allocation_target_shrinks_for_new_claimant():
++    maximum = ExecutionResources(
++        cpu=float("inf"),
++        gpu=4,
++        memory=float("inf"),
++        object_store_memory=float("inf"),
++    )
++    upstream = _mock_allocator_op(ExecutionResources(gpu=1), maximum)
++    downstream = _mock_allocator_op(ExecutionResources(gpu=1), maximum)
++    admission_states = {
++        upstream: ResourceAdmissionState.ADMITTED,
++        downstream: ResourceAdmissionState.DORMANT,
++    }
++    usages = {
++        # The upstream pool has already grown to consume the whole GPU budget.
++        upstream: ExecutionResources(gpu=2),
++        downstream: ExecutionResources.zero(),
++    }
++    resource_manager = MagicMock()
++    resource_manager._topology = {upstream: MagicMock(), downstream: MagicMock()}
++    resource_manager.get_resource_admission_state.side_effect = admission_states.get
++    resource_manager.get_resource_admission_minimum_resources.return_value = (
++        ExecutionResources(gpu=1)
++    )
++    resource_manager.get_mem_op_internal.return_value = 0
++    resource_manager.get_mem_op_outputs.return_value = 0
++    resource_manager.get_op_usage.side_effect = usages.get
++    resource_manager._is_blocking_materializing_op.return_value = False
++    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
++    limits = ExecutionResources(gpu=2, object_store_memory=1_000)
++
++    allocator.update_budgets(limits=limits)
++    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(2)
++
++    # A newly demanded downstream pool receives its protected one-actor floor.
++    # The upstream's current usage remains 2, but its independent target falls
++    # to 1 so the autoscaler can reclaim an idle actor.
++    admission_states[downstream] = ResourceAdmissionState.ADMITTED
++    allocator.update_budgets(limits=limits)
++    assert allocator.get_allocation(upstream).gpu == pytest.approx(2)
++    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(1)
++    assert allocator.get_allocation_target(downstream).gpu == pytest.approx(1)
++
++
++def test_fixed_gang_does_not_dilute_elastic_allocation_target():
++    def make_op(max_gpus):
++        return _mock_allocator_op(
++            ExecutionResources(gpu=1),
++            ExecutionResources(
++                cpu=float("inf"),
++                gpu=max_gpus,
++                memory=float("inf"),
++                object_store_memory=float("inf"),
++            ),
++        )
++
++    gang = make_op(max_gpus=1)
++    elastic = make_op(max_gpus=4)
++    resource_manager = MagicMock()
++    resource_manager._topology = {gang: MagicMock(), elastic: MagicMock()}
++    resource_manager.get_resource_admission_state.return_value = (
++        ResourceAdmissionState.ADMITTED
++    )
++    resource_manager.get_resource_admission_minimum_resources.return_value = (
++        ExecutionResources(gpu=1)
++    )
++    resource_manager.get_mem_op_internal.return_value = 0
++    resource_manager.get_mem_op_outputs.return_value = 0
++    resource_manager.get_op_usage.return_value = ExecutionResources.zero()
++    resource_manager._is_blocking_materializing_op.return_value = False
++    allocator = ReservationOpResourceAllocator(resource_manager, 0)
++
++    allocator.update_budgets(
++        limits=ExecutionResources(gpu=4, object_store_memory=1_000)
++    )
++
++    assert allocator.get_allocation_target(gang).gpu == pytest.approx(1)
++    assert allocator.get_allocation_target(elastic).gpu == pytest.approx(3)
++
++
+ def mock_all_to_all_op(input_op, name="MockShuffle"):
+     """Create a mock AllToAllOperator (shuffle) for testing."""
+     op = AllToAllOperator(
+@@ -113,6 +724,8 @@ def _resource_manager_for_limits_only_test(
+     call ``get_global_limits()`` and never iterate real operators."""
+     sink = MagicMock(spec=PhysicalOperator)
+     sink.output_dependencies = []
++    sink.resource_admission_spec.return_value = None
++    sink.min_scheduling_resources.return_value = ExecutionResources.zero()
+     topology = {sink: MagicMock()}
+     return ResourceManager(
+         topology,
+@@ -1018,6 +1631,37 @@ class TestOutputBackpressureGuard:
+         guard._idle_detector.detect_idle = MagicMock(return_value=False)
+         assert guard.should_unblock(o2) is False
+ 
++    def test_unblock_for_admission_managed_operator_without_runnable_worker(
++        self, restore_data_context
++    ):
++        o1 = InputDataBuffer(DataContext.get_current(), [])
++        o2 = mock_map_op(o1)
++        o3 = mock_map_op(o2)
++        topo = build_streaming_topology(o3, ExecutionOptions(), noop_counter())
++        resource_manager = ResourceManager(
++            topo,
++            ExecutionOptions(),
++            MagicMock(),
++            DataContext.get_current(),
++            BlockRefCounter(add_object_out_of_scope_callback=lambda *_: True),
++        )
++        guard = OutputBackpressureGuard(topo, resource_manager)
++        o3.num_active_tasks = MagicMock(return_value=0)
++        o3.can_add_input = MagicMock(return_value=False)
++        topo[o3].total_enqueued_input_blocks = MagicMock(return_value=5)
++        resource_manager.op_resource_allocator.can_submit_new_task = MagicMock(
++            return_value=True
++        )
++        guard._idle_detector.detect_idle = MagicMock(return_value=False)
++
++        # Legacy operators keep the historical budget-only behavior.
++        assert guard.should_unblock(o2) is False
++
++        resource_manager.get_resource_admission_state = MagicMock(
++            return_value=ResourceAdmissionState.ADMITTED
++        )
++        assert guard.should_unblock(o2) is True
++
+     def test_unblock_when_resource_allocator_disabled(self, restore_data_context):
+         """When the op resource allocator is disabled, the guard treats
+         downstream as schedulable (no budget to consult), so
+diff --git a/python/ray/data/tests/test_streaming_executor.py b/python/ray/data/tests/test_streaming_executor.py
+index 199a4f74d4..e25882f9f1 100644
+--- a/python/ray/data/tests/test_streaming_executor.py
++++ b/python/ray/data/tests/test_streaming_executor.py
+@@ -42,6 +42,7 @@ from ray.data._internal.execution.operators.map_transformer import (
+     MapTransformer,
+ )
+ from ray.data._internal.execution.ranker import DefaultRanker
++from ray.data._internal.execution.resource_admission import ResourceAdmissionState
+ from ray.data._internal.execution.resource_manager import ResourceManager
+ from ray.data._internal.execution.streaming_executor import (
+     StreamingExecutor,
+@@ -56,6 +57,7 @@ from ray.data._internal.execution.streaming_executor_state import (
+     get_eligible_operators,
+     process_completed_tasks,
+     select_operator_to_run,
++    start_streaming_topology,
+     update_operator_states,
+ )
+ from ray.data._internal.execution.util import make_ref_bundles
+@@ -136,6 +138,33 @@ def test_build_streaming_topology(verbose_progress, ray_start_regular_shared):
+     assert list(topo) == [o1, o2, o3]
+ 
+ 
++def test_build_then_start_streaming_topology_in_two_phases():
++    data_context = DataContext.get_current()
++    o1 = InputDataBuffer(data_context, input_data=[])
++    o2 = MapOperator.create(
++        make_map_transformer(lambda block: block),
++        o1,
++        data_context,
++    )
++    o1.start = MagicMock()
++    o2.start = MagicMock()
++    options = ExecutionOptions()
++    block_ref_counter = noop_counter()
++
++    topology = build_streaming_topology(
++        o2,
++        options,
++        block_ref_counter,
++        start_operators=False,
++    )
++
++    o1.start.assert_not_called()
++    o2.start.assert_not_called()
++    start_streaming_topology(topology, options, block_ref_counter)
++    o1.start.assert_called_once_with(options, block_ref_counter)
++    o2.start.assert_called_once_with(options, block_ref_counter)
++
++
+ def test_disallow_non_unique_operators(ray_start_regular_shared):
+     inputs = make_ref_bundles([[x] for x in range(20)])
+     # An operator [o1] cannot used in the same DAG twice.
+@@ -371,6 +400,21 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
+             # To ensure liveness back-pressure limits will be ignored
+             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
+ 
++    # Admission is a hard constraint: the idle-pipeline liveness fallback must
++    # not dispatch new input to a frontier pool and let it leapfrog upstream.
++    resource_manager.get_resource_admission_state.side_effect = (
++        lambda op: ResourceAdmissionState.FRONTIER if op is o2 else None
++    )
++    assert (
++        get_eligible_operators(
++            topo,
++            [],
++            ensure_liveness=True,
++            resource_manager=resource_manager,
++        )
++        == []
++    )
++
+ 
+ def test_backpressure_policy_tracking(ray_start_regular_shared):
+     """Test that backpressure policies that triggered are tracked correctly."""
+-- 
+2.34.1
+

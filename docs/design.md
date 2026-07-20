@@ -221,7 +221,7 @@ hooks. None contains cuDF, CUDA, fusion logic, or plugin imports.
 
 | Layer | Capability | Provenance |
 | --- | --- | --- |
-| C | Resource-aware admission for eligible GPU actor pools with statically declared resources | `pins/pr-candidate.json` records the exact local commit, changed files, LOC, tree, patch, and wheel hashes |
+| C | Generic admission for static GPU actor pools and fixed GPU shuffle/hash-aggregate gangs | `pins/pr-candidate.json` records the exact local commit, changed files, LOC, tree, patch, and wheel hashes |
 | H1 | Plan-local physical optimizer rules | First and only first hook in `ray-hooks/` |
 | H2 | Backend-neutral Parquet scan descriptor | Second and only second hook in `ray-hooks/` |
 
@@ -489,61 +489,64 @@ The plugin then reads footers, verifies source identity, plans exact row-group
 work, and selects cuDF/KvikIO runtime behavior. None of that GPU implementation
 is added to Ray.
 
-### 5.3 Resource-aware GPU actor admission
+### 5.3 Generic resource admission
 
 #### Why this change is needed
 
-Several GPU actor pools can become runnable in one physical DAG. If
-each requests its configured minimum without regard to the operator resource
-allocator, later pools can hold scarce GPUs while an earlier pool cannot acquire
-enough capacity to make progress. A plugin cannot safely coordinate this from
-inside its UDF because actor requests, allocations, scaling, and idle release
-belong to Ray.
+Several GPU resource owners can become runnable in one physical DAG. If each
+requests its configured minimum independently, later pools or fixed gangs can
+hold scarce GPUs while an earlier operator cannot acquire enough capacity to
+make progress. A plugin cannot safely coordinate this from inside its UDF
+because worker activation, allocations, scaling, and idle release belong to
+Ray.
 
-C adds generic admission control to Ray's resource manager. It applies only to
-GPU `ActorPoolMapOperator` instances with statically declared per-actor
-resources, operator reservation enabled, `wait_for_min_actors_s <= 0`, and no
-user-supplied dynamic `ray_remote_args_fn`.
-Unsupported or disabled cases retain the stock lifecycle.
+C adds a generic physical-operator admission contract to Ray's resource
+manager. Static GPU actor pools use an elastic-pool adapter, while GPU shuffle
+and hash aggregate use a fixed-gang adapter. Unsupported operators retain the
+stock lifecycle with a warning that deadlock protection does not apply.
 
 #### Where it lives
 
-- Ray resource-manager and actor-pool internals changed by C
-- Full diff: [`0001-ray-data-resource-aware-gpu-actor-admission.patch`](../ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch)
+- Ray resource-manager, actor-pool, and GPU-shuffle internals changed by C
+- Full diff: [`0001-ray-data-generic-resource-admission.patch`](../ray-pr-candidate/0001-ray-data-generic-resource-admission.patch)
 
 #### Ray code
 
 The candidate exposes a narrow internal capability contract:
 
 ```python
-GPU_ACTOR_ADMISSION_CONTROL_VERSION = 1
+RESOURCE_ADMISSION_CONTROL_VERSION = 1
 
 # Internal, environment-backed rollback field on DataContext; defaults true.
-_enable_gpu_actor_admission_control: bool
+_enable_resource_admission_control: bool
 ```
 
-For each demanded or active eligible pool, Ray calculates a one-actor
-CPU/GPU/memory floor. Claimants are scanned in topological order:
+Each participating operator reports elastic, fixed-gang, or transient bundle
+requirements through `PhysicalOperator.resource_admission_spec()`. Claimants
+are scanned in topological order:
 
 1. every floor that fits is admitted and receives an allocator allocation;
-2. an admitted pool starts on demand and may scale only within that allocation;
-3. the first floor that does not fit becomes the frontier and may retain one
-   queued actor request; and
+2. an elastic pool starts on demand and may scale only within its grant;
+3. the first floor that does not fit becomes the frontier; if it fits explicit
+   limits but is larger than current cluster capacity, it receives only its
+   minimum acquisition to drive autoscaling, while a frontier waiting on an
+   earlier owner receives zero units; and
 4. later claimants are blocked, preventing them from leapfrogging the frontier.
 
-Completed, dormant, and blocked pools cancel pending actors and release idle
-actors, but never active work. This lets a frontier request acquire capacity as
-soon as it is available. When enough GPUs exist, multiple admitted stages keep
-streaming concurrently instead of being serialized unnecessarily.
+Completed, dormant, and blocked elastic pools cancel pending actors and release
+idle actors, but never active work. Fixed gangs activate atomically and retain
+their grant after work starts until extraction completes. This lets a frontier
+request acquire capacity as soon as it is available. When enough GPUs exist,
+multiple admitted stages keep streaming concurrently.
 
 #### How the plugin uses it
 
 The plugin creates ordinary GPU actor pools with statically declared per-actor
 resources. Fixed and autoscaling pool sizes are both eligible. The plugin
-checks capability version 1 during compatibility validation, but does not pass
-private lifecycle arguments, mutate stock operators, or implement a second
-admission policy. Ray selects all eligible pools across the complete physical
-DAG, including stock and plugin-created pools.
+checks capability version 1 and requires every region it creates to report an
+`ELASTIC_POOL` specification, but does not implement a second admission policy.
+Ray selects all participants across the complete physical DAG, including stock
+and plugin-created pools.
 
 ### 5.4 Why these changes belong in Ray
 
@@ -551,8 +554,8 @@ The extension boundary is intentionally narrow:
 
 - optimizer invocation must be in Ray because Ray owns the physical plan;
 - scan description must be in Ray because Ray owns datasource semantics; and
-- actor admission must be in Ray because Ray owns resource allocation, actor
-  pools, and autoscaling.
+- resource admission must be in Ray because Ray owns resource allocation,
+  worker pools, gangs, and autoscaling.
 
 Everything that answers a GPU-specific question remains in the plugin:
 
@@ -834,13 +837,13 @@ execution profile into ordinary Ray remote arguments, including CPUs, one GPU
 per actor, memory, custom resources, placement, runtime environment, actor
 restart policy, and task retry policy.
 
-For an eligible static GPU pool, Ray admission reserves a one-actor floor when
-the pool is demanded or active and bounds later scaling by the allocator's
-allocation. Topological admitted/frontier/blocked states prevent later pools
-from capturing capacity needed by the frontier. Pools that become dormant,
-complete, or blocked cancel pending requests and release idle actors; active
-tasks continue normally. Independent stages whose floors fit may run and stream
-concurrently, while Ray Core retains placement authority.
+Each plugin region reports an elastic admission specification with a one-actor
+floor. Ray bounds scaling by its admission grant. Topological
+admitted/frontier/blocked states prevent later pools or gangs from capturing
+capacity needed by the frontier. Pools that become dormant, complete, or
+blocked cancel pending requests and release idle actors; active tasks continue
+normally. Independent stages whose floors fit may run and stream concurrently,
+while Ray Core retains placement authority.
 
 ## 11. Boundaries and memory behavior
 
@@ -923,7 +926,7 @@ because similarly named methods are present.
 
 The three capabilities are independently identifiable:
 
-- resource-aware GPU actor admission is the generic candidate C and has an
+- generic resource admission is candidate C and has an
   internal rollback field;
 - physical-rule injection is required for any optimizer plugin;
 - the external scan descriptor is required only for direct Parquet GPU reads.

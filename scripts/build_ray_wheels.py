@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Iterator
 
 CANDIDATE_PATCH = Path(
-    "ray-pr-candidate/0001-ray-data-resource-aware-gpu-actor-admission.patch"
+    "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch"
 )
 HOOK_PATCHES = (
     Path("ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch"),
@@ -46,8 +46,8 @@ HOOK_PATCHES = (
 CANDIDATE_MANIFEST = Path("pins/pr-candidate.json")
 HOOKED_MANIFEST = Path("pins/hooked-ray.json")
 BUILD_SCRIPT = "scripts/build_ray_wheels.py"
-CANDIDATE_BRANCH = "ray-data-gpu-actor-admission"
-CANDIDATE_SUBJECT = "[Data] Add resource-aware admission for GPU actor pools"
+CANDIDATE_BRANCH = "ray-data-resource-admission"
+CANDIDATE_SUBJECT = "[Data] Add generic resource admission for GPU operators"
 LEGACY_LIFECYCLE_SYMBOLS = (
     "defer_actor_start",
     "wait_for_upstream_deferred_operators",
@@ -73,9 +73,14 @@ EXPECTED_HOOK_PATHS = {
 CANDIDATE_PRODUCTION_PATHS = {
     "python/ray/data/context.py",
     "python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py",
+    "python/ray/data/_internal/execution/interfaces/physical_operator.py",
     "python/ray/data/_internal/execution/operators/actor_pool_map_operator.py",
+    "python/ray/data/_internal/execution/resource_admission.py",
     "python/ray/data/_internal/execution/resource_manager.py",
+    "python/ray/data/_internal/execution/streaming_executor.py",
     "python/ray/data/_internal/execution/streaming_executor_state.py",
+    "python/ray/data/_internal/gpu_shuffle/hash_aggregate.py",
+    "python/ray/data/_internal/gpu_shuffle/hash_shuffle.py",
 }
 CANDIDATE_FORBIDDEN_TEXT = (
     "custom_physical_optimizer_rule_classes",
@@ -85,7 +90,6 @@ CANDIDATE_FORBIDDEN_TEXT = (
     "ray-data-gpu-fusion",
     "plugin",
     "fusion",
-    "cudf",
 )
 
 
@@ -414,7 +418,7 @@ def _validate_candidate_scope(
     )
     if forbidden:
         raise RuntimeError(
-            "candidate C must contain only generic GPU actor admission control; "
+            "candidate C must contain only generic resource admission control; "
             f"found forbidden hook/plugin terms: {forbidden}"
         )
     return changed_paths, _line_counts(worktree)
@@ -840,10 +844,10 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
         ray_stock, stock_commit, "ray-direct-final-layer-"
     ) as direct_worktree:
         _apply_patches(direct_worktree, (candidate_patch, *hook_patches))
+        direct_tree = _stage_and_write_tree(direct_worktree)
         direct_full_overlay, direct_full_removals = _production_overlay(
             direct_worktree, base="HEAD"
         )
-        direct_tree = _stage_and_write_tree(direct_worktree)
         _validate_no_legacy_lifecycle_sources(
             direct_worktree, "independently derived final layer"
         )

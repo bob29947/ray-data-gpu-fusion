@@ -9,7 +9,7 @@ import ray.data
 from ray.data import ActorPoolStrategy
 
 import ray_data_gpu_fusion as rgf
-from ray_data_gpu_fusion._compat import optimized_physical_plan
+from ray_data_gpu_fusion._compat import AdmissionKind, optimized_physical_plan
 from ray_data_gpu_fusion.operators import ActorPoolGPUOperator
 
 
@@ -109,7 +109,7 @@ def test_parquet_map_fusion_runs_in_an_admission_managed_ray_actor(tmp_path):
         assert tuple(
             transform.kind for transform in regions[0].gpu_fusion_spec.transforms
         ) == ("read_parquet", "map_batches")
-        assert regions[0].uses_gpu_actor_admission_control()
+        assert regions[0].resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
 
         explanation = rgf.explain(dataset)
         assert "GPU fused" in explanation
