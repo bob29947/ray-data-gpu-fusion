@@ -1,4 +1,4 @@
-From afa776daadf514a1ba16821c8691088bcc2de78e Mon Sep 17 00:00:00 2001
+From 5b9ac4f86ca7bdf3d0b5f3d4d6b657f2e9e1fd5e Mon Sep 17 00:00:00 2001
 From: bob29947 <bob29947@users.noreply.github.com>
 Date: Fri, 17 Jul 2026 23:05:47 +0000
 Subject: [PATCH] [Data] Add generic resource admission for GPU operators
@@ -8,22 +8,22 @@ Subject: [PATCH] [Data] Add generic resource admission for GPU operators
  .../default_actor_autoscaler.py               | 100 ++-
  .../execution/interfaces/physical_operator.py |  30 +
  .../operators/actor_pool_map_operator.py      | 159 ++++-
- .../_internal/execution/resource_admission.py |  87 +++
+ .../_internal/execution/resource_admission.py |  86 +++
  .../_internal/execution/resource_manager.py   | 435 +++++++++++-
  .../_internal/execution/streaming_executor.py |   9 +-
  .../execution/streaming_executor_state.py     |  51 +-
  .../_internal/gpu_shuffle/hash_aggregate.py   |  12 +-
- .../_internal/gpu_shuffle/hash_shuffle.py     | 382 ++++++++---
+ .../_internal/gpu_shuffle/hash_shuffle.py     | 382 +++++++----
  python/ray/data/context.py                    |  10 +
- .../tests/test_actor_pool_map_operator.py     | 446 +++++++++++-
+ .../tests/test_actor_pool_map_operator.py     | 446 ++++++++++++-
  python/ray/data/tests/test_autoscaler.py      | 432 +++++++++++-
  python/ray/data/tests/test_gpu_aggregate.py   |  12 +-
- python/ray/data/tests/test_gpu_shuffle.py     | 523 ++++++++++++--
+ python/ray/data/tests/test_gpu_shuffle.py     | 523 +++++++++++++--
  python/ray/data/tests/test_map_operator.py    |   8 +-
  ...st_reservation_based_resource_allocator.py |   8 +
- .../ray/data/tests/test_resource_manager.py   | 644 ++++++++++++++++++
+ .../ray/data/tests/test_resource_manager.py   | 617 ++++++++++++++++++
  .../ray/data/tests/test_streaming_executor.py |  44 ++
- 19 files changed, 3156 insertions(+), 255 deletions(-)
+ 19 files changed, 3128 insertions(+), 255 deletions(-)
  create mode 100644 doc/source/data/release-notes/resource-admission-control.md
  create mode 100644 python/ray/data/_internal/execution/resource_admission.py
 
@@ -520,10 +520,10 @@ index 76afc11e4e..4ffe9e8134 100644
          # Enable actor fault tolerance by default, with infinite actor recreations and
 diff --git a/python/ray/data/_internal/execution/resource_admission.py b/python/ray/data/_internal/execution/resource_admission.py
 new file mode 100644
-index 0000000000..d2ace61ef9
+index 0000000000..38c9deddc6
 --- /dev/null
 +++ b/python/ray/data/_internal/execution/resource_admission.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,86 @@
 +from __future__ import annotations
 +
 +import enum
@@ -540,7 +540,6 @@ index 0000000000..d2ace61ef9
 +
 +
 +class AdmissionKind(enum.Enum):
-+    TRANSIENT = "transient"
 +    ELASTIC_POOL = "elastic_pool"
 +    FIXED_GANG = "fixed_gang"
 +
@@ -3749,7 +3748,7 @@ index 61708833d7..68bf36c39e 100644
  
          topo = build_streaming_topology(o5, ExecutionOptions(), noop_counter())
 diff --git a/python/ray/data/tests/test_resource_manager.py b/python/ray/data/tests/test_resource_manager.py
-index cdc85358c1..db4d212e5f 100644
+index cdc85358c1..0abb768442 100644
 --- a/python/ray/data/tests/test_resource_manager.py
 +++ b/python/ray/data/tests/test_resource_manager.py
 @@ -28,8 +28,17 @@ from ray.data._internal.execution.operators.join import JoinOperator
@@ -3770,7 +3769,7 @@ index cdc85358c1..db4d212e5f 100644
      create_resource_allocator,
  )
  from ray.data._internal.execution.streaming_executor_state import (
-@@ -94,6 +103,608 @@ def mock_join_op(left_input_op, right_input_op):
+@@ -94,6 +103,581 @@ def mock_join_op(left_input_op, right_input_op):
      return op
  
  
@@ -4133,33 +4132,6 @@ index cdc85358c1..db4d212e5f 100644
 +        _ResourceAdmissionController(states, resource_manager)
 +
 +
-+def test_resource_admission_supports_transient_contract():
-+    transient = _mock_resource_admission_op(
-+        kind=AdmissionKind.TRANSIENT,
-+        internal_demand=True,
-+        gpu=0.25,
-+        max_units=8,
-+    )
-+    states = {
-+        transient: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))
-+    }
-+    resource_manager = _mock_admission_resource_manager(
-+        ExecutionResources(cpu=8, gpu=2)
-+    )
-+    resource_manager.get_allocation_target.return_value = ExecutionResources(
-+        cpu=4, gpu=1
-+    )
-+    controller = _ResourceAdmissionController(states, resource_manager)
-+
-+    controller.update_states()
-+    controller.update_grants()
-+
-+    assert controller.get_state(transient) is ResourceAdmissionState.ADMITTED
-+    transient.apply_resource_admission_grant.assert_called_with(
-+        ResourceAdmissionGrant(max_units=4)
-+    )
-+
-+
 +def test_started_sticky_gang_protects_unfinished_admission_ancestors():
 +    upstream = _mock_resource_admission_op(internal_demand=True)
 +    gang = _mock_resource_admission_op(
@@ -4379,7 +4351,7 @@ index cdc85358c1..db4d212e5f 100644
  def mock_all_to_all_op(input_op, name="MockShuffle"):
      """Create a mock AllToAllOperator (shuffle) for testing."""
      op = AllToAllOperator(
-@@ -113,6 +724,8 @@ def _resource_manager_for_limits_only_test(
+@@ -113,6 +697,8 @@ def _resource_manager_for_limits_only_test(
      call ``get_global_limits()`` and never iterate real operators."""
      sink = MagicMock(spec=PhysicalOperator)
      sink.output_dependencies = []
@@ -4388,7 +4360,7 @@ index cdc85358c1..db4d212e5f 100644
      topology = {sink: MagicMock()}
      return ResourceManager(
          topology,
-@@ -1018,6 +1631,37 @@ class TestOutputBackpressureGuard:
+@@ -1018,6 +1604,37 @@ class TestOutputBackpressureGuard:
          guard._idle_detector.detect_idle = MagicMock(return_value=False)
          assert guard.should_unblock(o2) is False
  

@@ -521,7 +521,7 @@ RESOURCE_ADMISSION_CONTROL_VERSION = 1
 _enable_resource_admission_control: bool
 ```
 
-Each participating operator reports elastic, fixed-gang, or transient bundle
+Each participating operator reports elastic-pool or fixed-gang bundle
 requirements through `PhysicalOperator.resource_admission_spec()`. Claimants
 are scanned in topological order:
 

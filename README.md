@@ -33,6 +33,8 @@ actions.
 
 See [`docs/design.md`](docs/design.md) for the complete proposal,
 [`docs/architecture.md`](docs/architecture.md) for a compact execution summary,
+[`docs/plugin-design.md`](docs/plugin-design.md) for the standalone plugin
+architecture and extension contracts,
 [`docs/generic-resource-admission.md`](docs/generic-resource-admission.md)
 for the resource-aware GPU actor-pool design,
 and [`docs/phase-0.md`](docs/phase-0.md) for the exact support matrix.

@@ -2,11 +2,11 @@
 a9ccb950e57b81ce37448733a94992ea384ca470017be249588bdc3ef45da4ed  environment/ray-runtime-linux-py311.lock
 5f9d70191fd519c884e44cad1d169efd2fe405495bceb1aeedc2820af28cbc5b  pins/stock-ray.json
 ea48df721b40a0a3acb6264d346c7bd977ee85cb8de3f2b0ed08c39f55150b86  pins/source-snapshot.json
-016087d0f2254fe7cdfd8f7bbda412d9b400bc48d7cc0d11461e12a35c65bad6  ray-pr-candidate/0001-ray-data-generic-resource-admission.patch
+312dd53464474512dd68a1d2808f36bfa3093de00002e5d6a496e808a180c48c  ray-pr-candidate/0001-ray-data-generic-resource-admission.patch
 edabe51cc36d1a8569def4673e4a193831452fa2543307ab558892a70b29bc9a  ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch
 21790c188591e459ce271baca4ef06246276c31c1a1941723cb095ef0abd60ad  ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch
-10b368150f0aae06e880c77e086f96633e66e5c788fdf8a794c04f8ccc4267a5  pins/pr-candidate.json
-aa8d36a97e392b8d324e6bf45d1ad47aab02a04414fa9c1b076f1f37a6568ac6  pins/hooked-ray.json
+474481ec681e4bea36d2504ca98b3061a42fe7f8ec46520fe07afad93901f2c2  pins/pr-candidate.json
+24063e3e270698f6da2d12252ef9651031946c042b3619e7a4e0bb40f85867cc  pins/hooked-ray.json
 fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea  wheels/stock/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
-a72555129018bfd81de7bd6a3c30d556b884d0a40ea94be06e9b057a2a831a3d  wheels/pr-candidate/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
-22cbe26148aa50691f51295ff9b12f1d5d6e55215f86b68f9e19c954a5589a25  wheels/hooked/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
+9daec001c75396fdef439be66207bfc3fcd42e05fb4c3ec9f234048ba1ecac0e  wheels/pr-candidate/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl
+59ee1eaee0c75c8bcb295ad9bbfb6ba12e454c0a2578d2737cca15b9283a23f1  wheels/hooked/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl

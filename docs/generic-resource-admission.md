@@ -1,70 +1,187 @@
 # Generic Resource Admission for GPU Actors and Shuffle Gangs
 
-Status: implemented in PR-candidate commit `8ecf8f98d65157fbbf10129285547e554cc74e05`
-and preserved on `codex/generic-resource-admission`, replacing the actor-specific
-contract in Ray commit `ede9354`.
+Status: implemented in PR-candidate commit
+`5b9ac4f86ca7bdf3d0b5f3d4d6b657f2e9e1fd5e`, based on stock Ray commit
+`2741c6461d2bd3e5ff114af67be7a1190453dadd`.
 
-## 1. Problem
+This document describes the Ray Data PR candidate only. Plugin compatibility
+changes, local planning hooks, packaging, and generated wheels are outside the
+PR's code footprint.
 
-Ray Data can place several long-lived GPU resource owners in one physical DAG:
+## Summary
 
-- actor-based `map_batches`;
-- the rank actors for GPU shuffle;
-- the actor that runs `map_groups(batch_format="cudf")`;
-- `GPUHashAggregateOperator`, which uses the same rank-gang machinery; and
-- future GPU tasks, sorts, joins, or operators introduced by other Ray APIs.
+Ray Data needs to coordinate scarce GPU resources across a complete physical
+pipeline. Today, a resource-owning physical operator can begin creating actors
+or submitting work as execution starts, before the Ray Data resource manager
+has made a pipeline-level decision about which operator must run first. When
+several streaming stages need more GPUs than the pipeline can use at once,
+output backpressure and partial resource acquisition can form a deadlock.
 
-Ray Core schedules each actor or task correctly, but it does not know which
-owners form one Ray Data pipeline, which owner is an unfinished ancestor, or
-when an idle owner should release a GPU so another stage can make progress.
-Starting every pool and shuffle rank independently can therefore strand a
-pipeline when their combined GPU demand exceeds the execution capacity.
+This PR adds an internal, versioned resource-admission contract to
+`PhysicalOperator`. Operators describe their minimum progress floor as complete
+resource bundles. A topological controller admits the maximal prefix of
+operators whose floors fit, prevents later operators from leapfrogging the
+first non-fitting frontier, and grants excess resources only after every
+admitted floor is protected.
 
-For example, the following physical chain has four long-lived resource owners:
+The production adapters in this PR cover:
+
+- actor-based GPU `map_batches`;
+- actor-based `map_groups(batch_format="cudf")`, through the same actor-pool
+  operator;
+- the complete GPU shuffle rank group; and
+- `GPUHashAggregateOperator`, through its GPU shuffle base class.
+
+The contract remains extensible to a future task-specific admission kind, but
+this PR does not define or wire production GPU task admission. GPU tasks and
+unknown GPU operators retain legacy scheduling and emit a once-per-execution
+warning that deadlock protection does not apply.
+
+No public Dataset API or Ray Core change is required.
+
+## Problem statement
+
+Ray Data pipelines can contain several physical operators that acquire GPUs
+through long-lived actor pools, coordinated rank actors, or tasks.
+The streaming executor knows the dependency graph between these operators, but
+worker creation has historically not been gated by a pipeline-level admission
+decision.
+
+As a result:
+
+- an operator can begin asynchronous actor or placement-group creation before
+  the resource manager has decided that it should own GPUs;
+- an actor pool can retain more actors than it needs to make progress;
+- multiple operators can each hold or request only part of the capacity needed
+  by another operator; and
+- output backpressure can prevent the current GPU owner from finishing and
+  releasing its resources.
+
+### Deadlock example
+
+Consider this physical pipeline:
 
 ```text
-ActorPoolMap(map_batches)
-  -> Arrow ObjectRefs
-GPUShuffle rank gang
-  -> Arrow ObjectRefs
-ActorPoolMap(map_groups wrapper)
-  -> Arrow ObjectRefs
-ActorPoolMap(map_batches)
+Input -> GPU Pool A -> GPU Pool B -> Output
 ```
 
-On one GPU, none of the actor pools can coexist with a one-rank shuffle gang.
-If later owners acquire or queue resources without a pipeline-level policy,
-the upstream actor can be prevented from draining its streaming output while
-the downstream owner waits for the GPU held upstream. Proportional resource
-reservations alone do not fix this because a complete actor or gang is an
-indivisible placement request, and current over-allocation must not inflate an
-operator's future allocation target.
+Its resource configuration is:
 
-This must be solved in Ray Data rather than in a cuDF UDF or plugin. The
-streaming executor is the component that owns the complete physical topology,
-input and output queues, backpressure, operator resource accounting, and actor
-autoscaling. No Ray Core change is required.
+```text
+Cluster capacity: 1 GPU
+Pool A actor requirement: 1 GPU
+Pool B actor requirement: 1 GPU
+```
 
-## 2. Why the design fixes it
+Without pipeline-level admission, the following cycle is possible:
+
+1. Pool A owns the only GPU.
+2. Pool B begins requesting its actor but cannot start.
+3. Pool A's output queue reaches its backpressure limit.
+4. Pool A cannot finish and release its actor until Pool B consumes more
+   output.
+5. Pool B cannot consume output because it is waiting for the GPU held by Pool
+   A.
+
+The same issue is more severe for a coordinated GPU shuffle. A four-rank
+shuffle cannot make progress with only two ranks, even if a proportional
+allocator assigns it two GPUs.
+
+### Why Ray Core cannot solve the cycle
+
+Ray Core correctly schedules individual actors, tasks, and placement groups.
+It does not know:
+
+- which resource requests belong to one Ray Data physical DAG;
+- which operator is an unfinished ancestor of another operator;
+- which streaming edge is blocked by output backpressure;
+- which complete group of workers is required for operator progress; or
+- when an otherwise healthy actor should be released so another physical stage
+  can run.
+
+Ray Core should continue to perform exact placement, node-label enforcement,
+placement-group scheduling, and cluster autoscaling. Ray Data must decide which
+physical operators are allowed to create and retain those resource owners.
+
+### Why the existing Ray Data allocator is insufficient
+
+The existing allocator primarily distributes resource budgets
+proportionally. That is useful for throughput, but it does not provide a
+liveness guarantee for indivisible resource requests:
+
+- a one-GPU actor cannot run with a 0.5-GPU allocation if its declared bundle
+  requires one GPU;
+- a fixed-rank shuffle cannot run until every rank bundle is available;
+- current resource usage must not let an operator justify retaining an
+  over-allocation; and
+- allocator budgeting after eager worker startup is too late to control initial
+  acquisition.
+
+The policy must first reserve complete minimum progress floors, then share any
+remaining capacity for performance.
+
+## Goals and non-goals
+
+### Goals
+
+- Make the Ray Data physical DAG the authority for starting and retaining
+  scarce resource owners.
+- Express progress in complete usable units: one actor, one task, or
+  one complete fixed rank group.
+- Protect every admitted operator's minimum progress floor before allocating
+  excess resources.
+- Serialize GPU stages when their floors do not fit concurrently, while still
+  allowing overlap when they do.
+- Let upstream Arrow output queue or spill so an operator can finish and
+  release its GPUs before a downstream stage starts.
+- Support fractional CPU/GPU declarations, custom resources, label selectors,
+  explicit execution limits, and cluster autoscaling.
+- Provide an internal extension point for future GPU tasks, sorts, joins, and
+  other physical operators without adding controller type checks.
+
+### Non-goals
+
+- Replacing Ray Core scheduling or placement-group semantics.
+- Adding a public Dataset resource-admission API.
+- Wiring production `TaskPoolMapOperator` admission in this PR.
+- Fusing device memory across physical operators or removing Arrow boundaries.
+- Guaranteeing deadlock protection for GPU operators that cannot declare a
+  static resource envelope.
+
+## Proposed design
 
 Every supported GPU owner declares a versioned resource-admission
 specification. The executor considers complete progress floors in deterministic
 topological order before it shares excess capacity.
 
-An actor pool's progress floor is one complete actor, even when its configured
-minimum is larger. A shuffle's floor is its entire rank gang. The first floor
-that does not fit is the frontier, and later participants are blocked from
-leapfrogging it. Operators that lose a grant stop submitting new work; pending
-and idle actors are released, while active calls finish normally.
+An elastic actor pool's progress floor is one complete actor, even when its
+configured minimum pool size is larger. A fixed shuffle group's floor is the
+complete set of rank bundles. Ray scheduling calls such an atomically admitted
+set a gang, which is why the contract names this case `FIXED_GANG`. The first
+floor that does not fit is the
+frontier; all later participating operators are blocked from starting new
+resource acquisition. An operator that loses its grant stops submitting new
+work, releases pending and idle workers, and lets finite active work drain.
 
 This produces the intended one-GPU handoff:
+
+```text
+admit Pool A with one actor
+-> keep Pool B at a zero-unit frontier grant
+-> finish Pool A while queuing or spilling Arrow output
+-> release Pool A's actor
+-> admit Pool B
+-> consume the queued Arrow output
+```
+
+For the full supported chain, the same rule becomes:
 
 ```text
 finish upstream map_batches
 -> queue or spill Arrow blocks
 -> release its actor
--> activate the complete shuffle gang
--> extract queueable/spillable Arrow blocks
+-> activate the complete shuffle rank group
+-> extract queueable or spillable Arrow blocks
 -> remove the placement group
 -> activate map_groups
 -> release its actor
@@ -73,15 +190,18 @@ finish upstream map_batches
 
 The output-backpressure escape path lets the active upstream generator keep
 queuing Arrow blocks when its downstream admission boundary cannot yet run.
-That allows the upstream call to finish and its actor to become releasable.
+This lets the upstream call finish and makes its actor releasable.
 
-The policy is not a global GPU mutex. If every demanded minimum fits, actor
-stages and the gang are admitted together and may overlap. A default GPU
-shuffle gang contains one rank per currently detected cluster GPU, so it
-normally serializes with surrounding actors unless
-`gpu_shuffle_num_actors` is configured below total capacity.
+The policy is not a global GPU lock. When all demanded minimum floors fit,
+multiple stages are admitted and may overlap. A default GPU shuffle uses one
+rank per detected cluster GPU, so it normally serializes with surrounding GPU
+actors unless `gpu_shuffle_num_actors` is configured below total capacity.
 
-## 3. Internal contract
+This belongs in Ray Data because the streaming executor owns the physical
+topology, queues, backpressure state, resource accounting, and actor
+autoscaling. No Ray Core change is required.
+
+## Internal contract
 
 The contract is internal and explicitly versioned:
 
@@ -90,7 +210,6 @@ RESOURCE_ADMISSION_CONTROL_VERSION = 1
 
 
 class AdmissionKind(Enum):
-    TRANSIENT = "transient"
     ELASTIC_POOL = "elastic_pool"
     FIXED_GANG = "fixed_gang"
 
@@ -141,9 +260,9 @@ by `RAY_DATA_ENABLE_RESOURCE_ADMISSION_CONTROL`. Setting it to false makes the
 current actor and shuffle adapters use legacy acquisition and therefore removes
 the admission deadlock guarantee.
 
-## 4. Controller and executor lifecycle
+## Controller and executor lifecycle
 
-### 4.1 Two-phase startup
+### Two-phase startup
 
 Topology startup is split into two phases:
 
@@ -156,7 +275,7 @@ Topology startup is split into two phases:
 This prevents topology construction from eagerly consuming GPUs before the
 controller has seen the whole DAG.
 
-### 4.2 Participation
+### Participation
 
 An unfinished declared operator participates when it has external queued
 input, internal input, active work, pending resources, or owned resources.
@@ -170,7 +289,7 @@ participating when its inputs are complete, its input queues and active work
 are empty, and its adapter says its resources are releasable. This condition is
 what permits the downstream handoff.
 
-### 4.3 States and grants
+### States and grants
 
 The generic states are:
 
@@ -205,7 +324,7 @@ producer would strand the gang waiting for input that can no longer be made.
 The proportional allocator therefore tolerates this temporary over-capacity
 floor while Ray Core restores capacity, fails the owner, or the chain drains.
 
-## 5. Actor-pool adapter
+## Actor-pool adapter
 
 `ActorPoolMapOperator` reports `ELASTIC_POOL` when:
 
@@ -234,7 +353,7 @@ This one adapter covers stock actor `map_batches`, plugin-created actor regions,
 and actor cuDF `map_groups`, because `map_groups` lowers to an ordinary
 `ActorPoolMapOperator` wrapper. There is no groupby-specific admission code.
 
-## 6. Shuffle-gang adapter
+## Shuffle fixed-gang adapter
 
 `GPUShuffleOperator` reports `FIXED_GANG` with one normalized
 `CPU=1, GPU=1` bundle per rank, `max_units=1`, and
@@ -263,7 +382,7 @@ the same whole-gang cleanup.
 The configured `gpu_shuffle_num_actors` is preserved. When unset, rank count
 continues to default to all GPUs detected when the operator is planned.
 
-## 7. Arrow boundary
+## Arrow boundary
 
 Admission changes resource ownership, not the Ray Data block contract:
 
@@ -278,25 +397,25 @@ spilled while the next GPU owner waits, which is what makes a serialized
 one-GPU handoff possible. There is no direct device-buffer fusion across the
 shuffle or groupby boundary in this design.
 
-## 8. Extension model
+## Extension model
 
 The controller is intended to remain unchanged as coverage expands:
 
 - future APIs that lower to `ActorPoolMapOperator` inherit elastic admission;
 - a future GPU sort, join, or communicator group supplies a fixed-gang spec;
-- a future `TaskPoolMapOperator` adapter supplies one transient task bundle as
-  its floor and gates submissions with `max_units`; and
+- a future `TaskPoolMapOperator` adapter can add a task-specific kind, supply
+  one task bundle as its floor, and gate submissions with `max_units`; and
 - a new Ray API can implement the four `PhysicalOperator` hooks without
   depending on this plugin.
 
-`TRANSIENT` behavior is covered with fake operators now, but production GPU
-tasks intentionally remain warning-and-legacy in this release.
+Production GPU tasks intentionally remain warning-and-legacy in this release;
+the internal enum will grow when task admission has production semantics.
 
-## 9. Validation
+## Validation
 
 Implemented coverage includes:
 
-- elastic, fixed-gang, and transient contract tests;
+- elastic and fixed-gang contract tests;
 - topology chains, fan-in, fractional GPUs, complete gang floors, frontier
   behavior, sticky gangs, and drained-ancestor handoff;
 - zero-grant startup, fixed/autoscaling actor pools, asynchronous minimum-actor
@@ -321,7 +440,7 @@ plus one gang, validates the grouped result, and waits for complete GPU release.
 CPU-only shuffle and aggregate tests run with mocked Ray actors. The end-to-end
 test requires a working CUDA driver, cuDF, RAPIDS MPF, and UCXX.
 
-## 10. Implementation size
+## Implementation size
 
 Measured against unmodified stock Ray commit
 `2741c6461d2bd3e5ff114af67be7a1190453dadd`, counting added physical Python
@@ -329,12 +448,12 @@ source lines and excluding blank and comment-only lines:
 
 | Production area | Added NCLOC | Net NCLOC above stock |
 | --- | ---: | ---: |
-| Contract, hooks, controller, and allocator integration | 458 | 435 |
+| Contract, hooks, controller, and allocator integration | 457 | 434 |
 | Two-phase executor startup and backpressure gates | 45 | 43 |
 | Actor adapter and autoscaler integration | 198 | 167 |
 | Shuffle placement-group and asynchronous gang lifecycle | 259 | 142 |
 | Context capability flag | 6 | 6 |
-| **Total Ray production code** | **966** | **793** |
+| **Total Ray production code** | **965** | **792** |
 
 Tests, documentation, release notes, and plugin code are excluded. The plugin
 capability migration separately adds 39 and deletes 42 production NCLOC, for a
@@ -350,7 +469,7 @@ generic contract and controller, floor-first allocation, two-phase startup,
 actor admission adapter, and atomic shuffle-gang cleanup rather than only the
 new interface surface.
 
-## 11. Current limitations
+## Current limitations
 
 - Production GPU task admission is not wired yet.
 - Dynamic per-actor resource callbacks have no trustworthy static envelope and

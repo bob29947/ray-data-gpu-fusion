@@ -491,7 +491,6 @@ def main() -> int:
     if RESOURCE_ADMISSION_CONTROL_VERSION != 1:
         raise RuntimeError("candidate resource admission capability has wrong version")
     if {kind.value for kind in AdmissionKind} != {
-        "transient",
         "elastic_pool",
         "fixed_gang",
     }:

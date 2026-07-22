@@ -88,7 +88,6 @@ def _assert_wheel_backed_production(venv: Path, layer: str) -> None:
     if not hasattr(resource_admission, "AdmissionKind"):
         raise RuntimeError("installed Ray lacks generic resource admission types")
     if {kind.value for kind in resource_admission.AdmissionKind} != {
-        "transient",
         "elastic_pool",
         "fixed_gang",
     }:
