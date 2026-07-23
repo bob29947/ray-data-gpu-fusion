@@ -15,12 +15,12 @@ acquire resources; it does not make those APIs plugin fusion candidates.
 
 ## Ray resource-admission coverage
 
-Candidate C exposes internal resource-admission capability version 1. The
-first production adapters cover these physical resource owners:
+Candidate C exposes a private aggregate resource-admission grant. The first
+production adapters cover these physical resource owners:
 
 | Ray Data operation | Physical owner | Admission behavior |
 | --- | --- | --- |
-| Actor-based GPU `map_batches()` | `ActorPoolMapOperator` | Elastic pool with a one-complete-actor progress floor and scaling capped by its grant |
+| Actor-based GPU `map_batches()` | `ActorPoolMapOperator` | Elastic pool with its configured minimum-size progress floor and scaling capped by its grant |
 | Actor-based `map_groups(batch_format="cudf")` | The same `ActorPoolMapOperator` adapter | Elastic pool; cuDF conversion remains inside each per-group actor call |
 | GPU shuffle | `GPUShuffleOperator` rank pool | One atomic fixed gang containing every configured rank |
 | GPU hash aggregate | GPU shuffle base implementation | The same fixed-gang lifecycle, inherited without a controller special case |
@@ -37,7 +37,9 @@ sharing, not admission safety. A GPU actor pool with a user-supplied dynamic
 `ray_remote_args_fn` and no static resource envelope, a GPU task, or another
 GPU operator without an admission specification keeps legacy scheduling and
 emits a once-per-execution warning that deadlock protection does not apply.
-The internal `DataContext` rollback field can disable candidate C as a whole.
+The internal `DataContext` rollback field can disable candidate C as a whole,
+restoring legacy acquisition for actor pools as well as shuffles. It is not a
+placement-group-only switch.
 
 ## Intentionally deferred
 

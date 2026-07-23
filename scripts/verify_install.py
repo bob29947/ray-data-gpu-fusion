@@ -13,8 +13,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-candidate"
-CANDIDATE_BRANCH = "ray-data-resource-admission"
+CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-minimal"
+CANDIDATE_BRANCH = "codex/gpu-admission-minimal"
 CANDIDATE_SUBJECT = "[Data] Add generic resource admission for GPU operators"
 CANDIDATE_PATCH = Path(
     "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch"
@@ -22,12 +22,12 @@ CANDIDATE_PATCH = Path(
 HOOK_PATCHES = (
     Path("ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch"),
     Path(
-        "ray-hooks/"
-        "0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch"
+        "ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch"
     ),
 )
 CANDIDATE_MANIFEST = Path("pins/pr-candidate.json")
 HOOKED_MANIFEST = Path("pins/hooked-ray.json")
+PROTOTYPE_MANIFEST = Path("pins/prototype.json")
 STOCK_INPUTS = (
     Path("environment/rapids-25.12-linux-64.explicit.txt"),
     Path("environment/ray-runtime-linux-py311.lock"),
@@ -51,6 +51,7 @@ def _load_pin(name: str) -> dict:
 STOCK_PIN = _load_pin("stock-ray.json")
 CANDIDATE_PIN = _load_pin("pr-candidate.json")
 HOOKED_PIN = _load_pin("hooked-ray.json")
+PROTOTYPE_PIN = _load_pin("prototype.json")
 
 
 def _run(*args: str) -> str:
@@ -281,9 +282,11 @@ def _verify_checksums(wheel_name: str) -> None:
         *HOOK_PATCHES,
         CANDIDATE_MANIFEST,
         HOOKED_MANIFEST,
+        PROTOTYPE_MANIFEST,
         Path("wheels/stock") / wheel_name,
         Path("wheels/pr-candidate") / wheel_name,
         Path("wheels/hooked") / wheel_name,
+        Path("wheels/prototype") / wheel_name,
     }
     if set(entries) != expected_paths:
         missing = sorted(path.as_posix() for path in expected_paths - set(entries))
@@ -294,6 +297,34 @@ def _verify_checksums(wheel_name: str) -> None:
         )
     for relative, expected_hash in entries.items():
         _verify_file(ROOT / relative, expected_hash, f"checksum entry {relative}")
+
+
+def _verify_prototype_manifest(wheel_name: str) -> Path:
+    if (
+        PROTOTYPE_PIN.get("schema_version") != 1
+        or PROTOTYPE_PIN.get("layer") != "full-prototype"
+    ):
+        raise RuntimeError("pins/prototype.json has the wrong schema or layer")
+    if PROTOTYPE_PIN.get("base_commit") != STOCK_PIN.get("commit"):
+        raise RuntimeError("prototype manifest does not derive from pinned stock Ray")
+    if PROTOTYPE_PIN.get("base_version") != STOCK_PIN.get("version"):
+        raise RuntimeError("prototype manifest version does not match stock Ray")
+    if PROTOTYPE_PIN.get("wheel") != wheel_name:
+        raise RuntimeError("prototype manifest names a different wheel")
+    expected_hash = PROTOTYPE_PIN.get("wheel_sha256")
+    if (
+        not isinstance(expected_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+    ):
+        raise RuntimeError("prototype manifest has an invalid wheel SHA-256")
+    prototype_wheel = ROOT / "wheels" / "prototype" / wheel_name
+    _verify_file(prototype_wheel, expected_hash, "prototype wheel")
+    _verify_file_size(
+        prototype_wheel,
+        PROTOTYPE_PIN.get("wheel_size_bytes"),
+        "prototype wheel",
+    )
+    return prototype_wheel
 
 
 def _verify_manifest_links() -> tuple[Path, Path, Path]:
@@ -424,6 +455,7 @@ def _verify_manifest_links() -> tuple[Path, Path, Path]:
         HOOKED_PIN,
         "hooked wheel",
     )
+    _verify_prototype_manifest(wheel_name)
     return stock_wheel, candidate_wheel, hooked_wheel
 
 
@@ -478,9 +510,9 @@ def main() -> int:
         ActorPoolMapOperator,
     )
     from ray.data._internal.gpu_shuffle.hash_shuffle import GPUShuffleOperator
-    from ray.data._internal.execution.resource_admission import AdmissionKind
-    from ray.data._internal.execution.resource_manager import (
-        RESOURCE_ADMISSION_CONTROL_VERSION,
+    from ray.data._internal.execution.resource_admission import (
+        ResourceAdmissionGrant,
+        ResourceAdmissionSpec,
     )
 
     if not hasattr(DataContext(), "custom_physical_optimizer_rule_classes"):
@@ -488,16 +520,20 @@ def main() -> int:
     if not hasattr(ParquetDatasource, "get_external_scan_descriptor"):
         raise RuntimeError("Parquet external scan descriptor hook H2 is absent")
     context = DataContext()
-    if RESOURCE_ADMISSION_CONTROL_VERSION != 1:
-        raise RuntimeError("candidate resource admission capability has wrong version")
-    if {kind.value for kind in AdmissionKind} != {
-        "elastic_pool",
-        "fixed_gang",
-    }:
-        raise RuntimeError("candidate resource admission kinds have changed")
+    if tuple(ResourceAdmissionSpec.__dataclass_fields__) != (
+        "minimum_resources",
+        "unit_resources",
+        "min_units",
+        "max_units",
+    ):
+        raise RuntimeError("candidate resource admission specification shape changed")
+    if tuple(ResourceAdmissionGrant.__dataclass_fields__) != (
+        "max_units",
+        "may_submit",
+    ):
+        raise RuntimeError("candidate resource admission grant shape has changed")
     for hook in (
         "resource_admission_spec",
-        "has_internal_admission_demand",
         "apply_resource_admission_grant",
         "can_release_resource_admission",
     ):
@@ -562,7 +598,12 @@ def main() -> int:
                 "hooked_wheel_sha256": HOOKED_PIN["wheel_sha256"],
                 "plugin": rgf.__version__,
                 "adapter": compatibility.adapter,
-                "resource_admission_control": RESOURCE_ADMISSION_CONTROL_VERSION,
+                "resource_admission_spec_fields": list(
+                    ResourceAdmissionSpec.__dataclass_fields__
+                ),
+                "resource_admission_grant_fields": list(
+                    ResourceAdmissionGrant.__dataclass_fields__
+                ),
                 "runtime": runtime_versions,
             },
             indent=2,

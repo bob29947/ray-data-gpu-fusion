@@ -8,6 +8,9 @@ __pycache__/
 dist/
 build/
 benchmark/results/
+benchmark/cloud/local-config.json
+benchmark/cloud/rendered/
+benchmark/cloud/artifacts/
 .coverage
 coverage.xml
 cufile.log

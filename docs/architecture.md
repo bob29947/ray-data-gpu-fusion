@@ -88,13 +88,13 @@ GPU region A -> Arrow Ray blocks -> GPU region B
 
 The regions have separate Ray actor pools. The resource manager admits eligible
 static-resource GPU pools in topological order against
-the operator-reservation allocation. Every admitted pool receives at least a
-one-actor floor and may scale only within its allocation. The first pool whose
-floor does not fit is the frontier and may retain one queued actor request;
-later pools are blocked so they cannot leapfrog it. Dormant, completed, and
-blocked pools cancel pending actors and release idle actors, never active work.
-Ray Core still decides actor placement, and independent stages can stream
-concurrently whenever their floors fit.
+the operator-reservation allocation. Every admitted pool receives its configured
+minimum-size floor and may scale only within its allocation. The first pool
+whose floor does not fit is the frontier and may request that minimum for
+autoscaling; later pools cannot leapfrog it. Dormant, completed, and blocked
+pools cancel pending actors and release idle actors, never active work. Ray Core
+still decides actor placement, and independent stages can stream concurrently
+whenever their floors fit.
 
 This trades extra device/host conversion and Object Store pressure for a
 simple ownership boundary and deadlock-free Phase-0 resource behavior. An
@@ -127,12 +127,15 @@ The pinned stock checkout is immutable. Derived Ray is split into two auditable
 layers:
 
 1. C is the standalone PR candidate for generic resource admission. It exposes
-   capability version 1 and an internal `DataContext` rollback field. Today it
-   adapts statically declared GPU actor pools and atomic GPU shuffle/hash-
-   aggregate gangs. Safety floors remain enabled without proportional operator
-   reservation, minimum-actor readiness is asynchronous after admission, and a
-   user-supplied dynamic `ray_remote_args_fn` retains legacy scheduling with a
-   warning; C contains no plugin dependency.
+   a four-field private specification, a two-field private grant, and a
+   whole-controller `DataContext` rollback field. Disabling the field restores
+   legacy acquisition for actor pools as well as shuffles; it is not a
+   placement-group-only switch. Today C adapts statically declared GPU actor
+   pools and atomic GPU shuffle/hash-aggregate gangs. Safety floors remain
+   enabled without proportional operator reservation, minimum-actor readiness
+   is asynchronous after admission, and a user-supplied dynamic
+   `ray_remote_args_fn` retains legacy scheduling with a warning; C contains no
+   plugin dependency.
 2. H1 adds plan-local physical optimizer rule classes on `DataContext`.
 3. H2 adds a conservative Parquet external-scan descriptor that performs no
    I/O.

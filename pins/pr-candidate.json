@@ -4,14 +4,14 @@
   "base_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
   "base_version": "3.0.0.dev0",
   "stock_wheel_sha256": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
-  "local_commit": "5b9ac4f86ca7bdf3d0b5f3d4d6b657f2e9e1fd5e",
+  "local_commit": "31d4448482c1a47e034e9160d1d8f41e84cd1a25",
   "patch": {
     "file": "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch",
-    "from_commit": "5b9ac4f86ca7bdf3d0b5f3d4d6b657f2e9e1fd5e",
-    "sha256": "312dd53464474512dd68a1d2808f36bfa3093de00002e5d6a496e808a180c48c"
+    "from_commit": "31d4448482c1a47e034e9160d1d8f41e84cd1a25",
+    "sha256": "dad79e1e631c18a60d139d01806a6bc5ca9083a2e355dc7ae9d87668eb35f8cf"
   },
-  "patch_series_sha256": "a5d1e9be861a372b2cb6a278447b401e1037a5fe812e8600cd819d0cad6231a1",
-  "source_tree": "df683474b4b6768f6be8c93a8ae6c6676d21a5d8",
+  "patch_series_sha256": "e0dac4144f8dc0f610fd4c1529f08b56f3ee23676da84343610cc6580c719d0c",
+  "source_tree": "16dbda6d83daff916f5dab3a4288ce65a2d618df",
   "changed_files": [
     "doc/source/data/release-notes/resource-admission-control.md",
     "python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py",
@@ -34,26 +34,26 @@
     "python/ray/data/tests/test_streaming_executor.py"
   ],
   "loc": {
-    "insertions": 3128,
-    "deletions": 255
+    "insertions": 3353,
+    "deletions": 281
   },
   "production_delta": {
     "files": {
-      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "48e1ada5cad1b3bc0c83a4c73196552934c1e0e249df8294531987d3e4568316",
-      "ray/data/_internal/execution/interfaces/physical_operator.py": "aab0ae46dbb34ea451cd6ea1b90835ca3f137a1ce54c91488de38875b47e1767",
-      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "5ff098dfb4e6b50b1a4b910c155f0c6ac39dc88402f506248d8b9e90b0682f2c",
-      "ray/data/_internal/execution/resource_admission.py": "4900aca5ba64080b66b8c92e6103ca87fd30a0e257bf56eff2fb85202afcaa52",
-      "ray/data/_internal/execution/resource_manager.py": "8702d84db60dca04ce8afa2a4f5b92e2197f69852dd6b62c4242ad85f95c79b9",
+      "ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py": "4712868caf1dafcc537d0a927f36b034a8d5b1d8c6d2b4affe34effea1e7b9a8",
+      "ray/data/_internal/execution/interfaces/physical_operator.py": "29b10a9804bd5a79d3b96b197125764960acc6aec65b901599dda002c0200a2f",
+      "ray/data/_internal/execution/operators/actor_pool_map_operator.py": "2ca778454043369ad5a5e53e4b00628dd1b260cc6dd4235a4d1c18b30de3c677",
+      "ray/data/_internal/execution/resource_admission.py": "9a2c36e49b22a9a554f5d346cee458f402a95a224c73a93eeb497fb2dcb0c9e4",
+      "ray/data/_internal/execution/resource_manager.py": "5f727dd04feddd610c6f7ee0ff20859a9394896d3c44a7f2deda53f64c15c384",
       "ray/data/_internal/execution/streaming_executor.py": "e00af1085837c5220a0c727496fd63e6af567d3d88eaa215c3393282d1574b33",
-      "ray/data/_internal/execution/streaming_executor_state.py": "2b6cafc691f3cecfbe1616b80c68e50823210276de63be911e45b0cd565a6dbd",
-      "ray/data/_internal/gpu_shuffle/hash_aggregate.py": "d007c54c1440eca13437965daa3fbc5e24f9802a6e508d22df3689222c438be4",
-      "ray/data/_internal/gpu_shuffle/hash_shuffle.py": "b6133b5f11b118df2e0c0591ea73a7d2120a96276e81373747b8f956338da939",
-      "ray/data/context.py": "80559012fde7516f0c302541f24f0daa3a408370aab497319a40e60ef8b53a46"
+      "ray/data/_internal/execution/streaming_executor_state.py": "b4b4799c75294c63956aad9ce66efe6312a21279bde1655d0330ae9197743b3f",
+      "ray/data/_internal/gpu_shuffle/hash_aggregate.py": "97e8535fed77cf9e85eef7b9d6065911c6b7977f77438435fda5ec110f2eacc0",
+      "ray/data/_internal/gpu_shuffle/hash_shuffle.py": "b14644d8c3b4d9544696eac06aaef47b9e30f0c714387720d1998f376e9f79e0",
+      "ray/data/context.py": "2e50fe8b215a5d02480152df9087dccae9854c0c9764d2a5b3265ff2342e9642"
     },
     "removed": []
   },
   "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
-  "wheel_sha256": "9daec001c75396fdef439be66207bfc3fcd42e05fb4c3ec9f234048ba1ecac0e",
-  "wheel_size_bytes": 40328178,
+  "wheel_sha256": "e26e04f95572010151f379f044f10f01bcf716bde49caf2688f586781f500309",
+  "wheel_size_bytes": 40326251,
   "build": "scripts/build_ray_wheels.py"
 }

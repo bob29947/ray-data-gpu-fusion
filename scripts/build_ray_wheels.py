@@ -39,14 +39,14 @@ CANDIDATE_PATCH = Path(
 HOOK_PATCHES = (
     Path("ray-hooks/0001-ray-data-support-plan-local-physical-optimizer-rules.patch"),
     Path(
-        "ray-hooks/"
-        "0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch"
+        "ray-hooks/0002-ray-data-expose-backend-neutral-parquet-scan-descriptor.patch"
     ),
 )
 CANDIDATE_MANIFEST = Path("pins/pr-candidate.json")
 HOOKED_MANIFEST = Path("pins/hooked-ray.json")
 BUILD_SCRIPT = "scripts/build_ray_wheels.py"
-CANDIDATE_BRANCH = "ray-data-resource-admission"
+CANDIDATE_BRANCH = "codex/gpu-admission-minimal"
+CANDIDATE_WORKTREE = Path(".worktrees/ray-pr-minimal")
 CANDIDATE_SUBJECT = "[Data] Add generic resource admission for GPU operators"
 LEGACY_LIFECYCLE_SYMBOLS = (
     "defer_actor_start",
@@ -73,6 +73,7 @@ EXPECTED_HOOK_PATHS = {
 CANDIDATE_PRODUCTION_PATHS = {
     "python/ray/data/context.py",
     "python/ray/data/_internal/actor_autoscaler/default_actor_autoscaler.py",
+    "python/ray/data/_internal/cluster_autoscaler/default_autoscaling_coordinator.py",
     "python/ray/data/_internal/execution/interfaces/physical_operator.py",
     "python/ray/data/_internal/execution/operators/actor_pool_map_operator.py",
     "python/ray/data/_internal/execution/resource_admission.py",
@@ -237,8 +238,7 @@ def _validate_stock(ray_stock: Path, stock_wheel: Path, stock_pin: dict) -> None
     expected_hash = stock_pin.get("wheel_sha256")
     if actual_hash != expected_hash:
         raise RuntimeError(
-            "stock wheel SHA-256 mismatch: "
-            f"expected {expected_hash}, got {actual_hash}"
+            f"stock wheel SHA-256 mismatch: expected {expected_hash}, got {actual_hash}"
         )
     with zipfile.ZipFile(stock_wheel) as archive:
         try:
@@ -262,16 +262,15 @@ def _validate_local_candidate_commit(
     *,
     expected_tree: str | None = None,
 ) -> None:
-    candidate_worktree = project_root / ".worktrees" / "ray-pr-candidate"
+    candidate_worktree = project_root / CANDIDATE_WORKTREE
     if not candidate_worktree.exists():
         raise RuntimeError(
-            "missing required local PR-candidate worktree: " f"{candidate_worktree}"
+            f"missing required local PR-candidate worktree: {candidate_worktree}"
         )
     status = _git(candidate_worktree, "status", "--porcelain").strip()
     if status:
         raise RuntimeError(
-            "local PR-candidate worktree must be clean before finalization:\n"
-            f"{status}"
+            f"local PR-candidate worktree must be clean before finalization:\n{status}"
         )
     head = _git(candidate_worktree, "rev-parse", "HEAD").strip()
     if head != candidate_commit:
@@ -748,8 +747,89 @@ def _validate_or_report_manifest(
         print(json.dumps(expected, indent=2, sort_keys=False))
 
 
+def _stage_manifest(path: Path, value: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(json.dumps(value, indent=2, sort_keys=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+        temporary.chmod(mode)
+        return temporary
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _write_manifests_transactionally(items: tuple[tuple[Path, dict], ...]) -> None:
+    """Publish a manifest set, restoring every original on replacement failure."""
+    paths = [path for path, _ in items]
+    if len(paths) != len(set(paths)):
+        raise ValueError("manifest transaction contains duplicate paths")
+    staged: dict[Path, Path] = {}
+    backups: dict[Path, Path | None] = {}
+    rollback_paths: list[Path] = []
+    preserve_backups = False
+    try:
+        for path, value in items:
+            staged[path] = _stage_manifest(path, value)
+        for path in paths:
+            if path.exists():
+                descriptor, backup_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.backup.", dir=path.parent
+                )
+                os.close(descriptor)
+                backup = Path(backup_name)
+                shutil.copy2(path, backup)
+                backups[path] = backup
+            else:
+                backups[path] = None
+        for path in paths:
+            rollback_paths.append(path)
+            os.replace(staged[path], path)
+    except BaseException as error:
+        rollback_errors = []
+        for path in reversed(rollback_paths):
+            try:
+                backup = backups[path]
+                if backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, path)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"{path}: {rollback_error}")
+        if rollback_errors:
+            preserve_backups = True
+            recovery_paths = [
+                str(backup)
+                for backup in backups.values()
+                if backup is not None and backup.exists()
+            ]
+            raise RuntimeError(
+                "manifest publication failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+                + f"; preserved recovery files: {recovery_paths}"
+            ) from error
+        raise
+    finally:
+        cleanup = list(staged.values())
+        if not preserve_backups:
+            cleanup.extend(backup for backup in backups.values() if backup is not None)
+        for temporary in cleanup:
+            temporary.unlink(missing_ok=True)
+
+
 def build(args: argparse.Namespace) -> tuple[Path, Path]:
     project_root = args.project_root.resolve()
+    if getattr(args, "write_pins", False) and (
+        args.candidate_output_dir is not None or args.hooked_output_dir is not None
+    ):
+        raise RuntimeError("--write-pins requires the default wheel output directories")
     ray_stock = project_root / "ray-stock"
     stock_pin = _load_json(project_root / "pins" / "stock-ray.json", required=True)
     assert stock_pin is not None
@@ -930,6 +1010,15 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
         "wheel_size_bytes": hooked_output.stat().st_size,
         "build": BUILD_SCRIPT,
     }
+    if getattr(args, "write_pins", False):
+        _write_manifests_transactionally(
+            (
+                (project_root / CANDIDATE_MANIFEST, candidate_expected),
+                (project_root / HOOKED_MANIFEST, hooked_expected),
+            )
+        )
+        candidate_manifest = candidate_expected
+        hooked_manifest = hooked_expected
     _validate_or_report_manifest(
         CANDIDATE_MANIFEST,
         candidate_manifest,
@@ -966,6 +1055,11 @@ def main() -> None:
         "--require-pins",
         action="store_true",
         help="require complete, matching candidate and hooked manifests",
+    )
+    parser.add_argument(
+        "--write-pins",
+        action="store_true",
+        help="atomically refresh the derived candidate and hooked manifests",
     )
     build(parser.parse_args())
 

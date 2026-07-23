@@ -1,0 +1,18 @@
+{
+  "region": "us-west-2",
+  "availability_zone": "us-west-2d",
+  "ami_id": "REPLACE_WITH_GPU_COMPATIBLE_PY311_AMI_ID",
+  "subnet_id": "REPLACE_WITH_SUBNET_ID",
+  "security_group_ids": [
+    "REPLACE_WITH_SECURITY_GROUP_ID"
+  ],
+  "iam_instance_profile_arn": "REPLACE_WITH_INSTANCE_PROFILE_ARN",
+  "aws_profile": null,
+  "ec2_key_name": null,
+  "ssh_private_key_path": null,
+  "ssh_user": "ubuntu",
+  "docker_image": "rayproject/ray:2.55.1-py311",
+  "gpu_instance_type": "g6.4xlarge",
+  "cpu_head_instance_type": "m6i.4xlarge",
+  "root_volume_gib": 100
+}

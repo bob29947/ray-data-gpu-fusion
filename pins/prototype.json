@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "layer": "full-prototype",
+  "base_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+  "base_version": "3.0.0.dev0",
+  "local_commit": "5b9ac4f86ca7bdf3d0b5f3d4d6b657f2e9e1fd5e",
+  "source_tree": "df683474b4b6768f6be8c93a8ae6c6676d21a5d8",
+  "patch_sha256": "312dd53464474512dd68a1d2808f36bfa3093de00002e5d6a496e808a180c48c",
+  "wheel": "ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl",
+  "wheel_sha256": "9daec001c75396fdef439be66207bfc3fcd42e05fb4c3ec9f234048ba1ecac0e",
+  "wheel_size_bytes": 40328178
+}

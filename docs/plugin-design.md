@@ -127,9 +127,13 @@ The plugin checks all required Ray capabilities before changing a context:
 1. the exact supported Ray commit;
 2. plan-local physical optimizer rule classes on `DataContext`;
 3. the backend-neutral Parquet scan descriptor;
-4. generic resource-admission capability version 1;
+4. the exact private aggregate resource-admission specification and grant
+   shapes;
 5. elastic resource admission for `ActorPoolMapOperator`; and
-6. the resource-admission rollback field being enabled.
+6. the whole-controller resource-admission rollback field being enabled.
+
+Disabling that field restores legacy acquisition for actor pools as well as
+shuffles; it is not a placement-group-only switch.
 
 Missing or disabled capabilities cause `enable()` to fail closed. The checks
 are repeated during physical planning because a context can be mutated after
@@ -465,13 +469,13 @@ before it can replace the Arrow boundary.
 
 ## Resource admission
 
-Every plugin-created actor region must expose Ray's generic `ELASTIC_POOL`
-admission specification. The plugin verifies this immediately after creating
-the physical operator.
+Every plugin-created actor region must expose Ray's aggregate elastic admission
+specification (`unit_resources` is present). The plugin verifies this
+immediately after creating the physical operator.
 
 The plugin does not implement admission policy. Ray's resource manager decides
-which physical operators may create and retain GPU actors, protects a
-one-complete-actor progress floor, prevents later stages from leapfrogging a
+which physical operators may create and retain GPU actors, protects the
+configured minimum-size progress floor, prevents later stages from leapfrogging a
 non-fitting frontier, and caps actor-pool scaling through grants.
 
 This separation is intentional:
@@ -589,8 +593,9 @@ The plugin is validated at four levels:
 1. **Specification and runtime unit tests** cover payload composition,
    execution-profile compatibility, batching, empty outputs, source mutation,
    and fusion selection.
-2. **Ray contract tests** verify H1/H2, capability versioning, plan locality,
-   failure-closed behavior, and resource-admission participation.
+2. **Ray contract tests** verify H1/H2, the exact private specification and
+   grant shapes, plan locality, failure-closed behavior, and resource-admission
+   participation.
 3. **Integration tests** execute standalone Arrow boundaries, fused Parquet-map
    regions, and stock fallback.
 4. **Stock-versus-plugin smoke tests** run in separate processes and compare

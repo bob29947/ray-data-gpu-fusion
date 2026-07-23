@@ -11,7 +11,10 @@ import ray
 import ray.data
 import ray_data_gpu_fusion as rgf
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
-from ray.data._internal.execution import resource_manager
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
 )
@@ -21,10 +24,10 @@ from ray.data._internal.logical.optimizers import PhysicalOptimizer
 from ray.data._internal.logical.operators import Read
 from ray.data.context import DataContext
 from ray_data_gpu_fusion._compat import (
-    AdmissionKind,
     ParquetDatasource,
     RESOURCE_ADMISSION_CONTEXT_ATTR,
-    RESOURCE_ADMISSION_CONTROL_VERSION,
+    RESOURCE_ADMISSION_GRANT_FIELDS,
+    RESOURCE_ADMISSION_SPEC_FIELDS,
     RayCompatibilityError,
     compatibility,
     optimized_physical_plan,
@@ -122,9 +125,11 @@ def test_required_hooks_and_generic_gpu_admission_capability_are_available():
 
     assert info.supported
     assert info.missing_seams == ()
-    assert (
-        resource_manager.RESOURCE_ADMISSION_CONTROL_VERSION
-        == RESOURCE_ADMISSION_CONTROL_VERSION
+    assert tuple(ResourceAdmissionSpec.__dataclass_fields__) == (
+        RESOURCE_ADMISSION_SPEC_FIELDS
+    )
+    assert tuple(ResourceAdmissionGrant.__dataclass_fields__) == (
+        RESOURCE_ADMISSION_GRANT_FIELDS
     )
     assert getattr(context, RESOURCE_ADMISSION_CONTEXT_ATTR) is True
 
@@ -208,7 +213,8 @@ def test_default_public_parquet_read_has_external_scan_descriptor(tmp_path):
 @pytest.mark.parametrize(
     ("missing", "expected_seam"),
     (
-        ("candidate", "resource_admission_control_v1"),
+        ("candidate_spec", "aggregate_resource_admission_spec"),
+        ("candidate", "aggregate_resource_admission_grant"),
         ("candidate_hook", "actor_pool_resource_admission_spec"),
         ("context", "resource_admission_context"),
         ("h1", "plan_local_physical_rules"),
@@ -221,8 +227,12 @@ def test_enable_fails_closed_when_a_required_capability_is_missing(
     context = DataContext.get_current().copy()
     original_rules = list(context.custom_physical_optimizer_rule_classes)
 
-    if missing == "candidate":
-        monkeypatch.delattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION")
+    if missing == "candidate_spec":
+        spec_fields = dict(ResourceAdmissionSpec.__dataclass_fields__)
+        spec_fields.pop("max_units")
+        monkeypatch.setattr(ResourceAdmissionSpec, "__dataclass_fields__", spec_fields)
+    elif missing == "candidate":
+        monkeypatch.setattr(ResourceAdmissionGrant, "__dataclass_fields__", {})
     elif missing == "candidate_hook":
         monkeypatch.delattr(ActorPoolMapOperator, "resource_admission_spec")
     elif missing == "context":
@@ -331,7 +341,7 @@ def test_stock_callable_class_gpu_map_batches_share_one_gpu(one_gpu_context):
     ]
     assert len(actor_regions) == 2
     assert all(
-        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        region.resource_admission_spec().unit_resources is not None
         for region in actor_regions
     )
 
@@ -383,7 +393,7 @@ def test_plugin_created_gpu_regions_share_one_gpu(monkeypatch, one_gpu_context):
     assert len(plugin_regions) == 2
     assert all(region._ray_remote_args["num_gpus"] == 1 for region in plugin_regions)
     assert all(
-        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        region.resource_admission_spec().unit_resources is not None
         for region in plugin_regions
     )
 
@@ -452,7 +462,7 @@ def test_incompatible_plugin_gpu_regions_hand_off_one_gpu(monkeypatch, one_gpu_c
     ]
     assert len(plugin_regions) == 2
     assert all(
-        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        region.resource_admission_spec().unit_resources is not None
         for region in plugin_regions
     )
 
@@ -520,7 +530,7 @@ def test_plugin_decline_to_stock_gpu_actor_is_admission_safe(
     assert plugin_regions
     assert stock_regions
     assert all(
-        region.resource_admission_spec().kind is AdmissionKind.ELASTIC_POOL
+        region.resource_admission_spec().unit_resources is not None
         for region in (*plugin_regions, *stock_regions)
     )
 

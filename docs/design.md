@@ -500,10 +500,11 @@ make progress. A plugin cannot safely coordinate this from inside its UDF
 because worker activation, allocations, scaling, and idle release belong to
 Ray.
 
-C adds a generic physical-operator admission contract to Ray's resource
-manager. Static GPU actor pools use an elastic-pool adapter, while GPU shuffle
-and hash aggregate use a fixed-gang adapter. Unsupported operators retain the
-stock lifecycle with a warning that deadlock protection does not apply.
+C adds a small aggregate physical-operator admission contract to Ray's resource
+manager. Static GPU actor pools report per-actor units and their real configured
+minimum; GPU shuffle and hash aggregate report one fixed aggregate floor.
+Adapters with dynamic or constrained resources retain the stock lifecycle and
+warn that deadlock protection does not apply.
 
 #### Where it lives
 
@@ -512,17 +513,26 @@ stock lifecycle with a warning that deadlock protection does not apply.
 
 #### Ray code
 
-The candidate exposes a narrow internal capability contract:
+The candidate exposes a narrow private capability contract:
 
 ```python
-RESOURCE_ADMISSION_CONTROL_VERSION = 1
+ResourceAdmissionSpec(
+    minimum_resources: ExecutionResources,
+    unit_resources: Optional[ExecutionResources],
+    min_units: int,
+    max_units: Optional[int],
+)
+ResourceAdmissionGrant(max_units: int, may_submit: bool)
 
-# Internal, environment-backed rollback field on DataContext; defaults true.
+# Whole-controller, environment-backed rollback field; defaults true.
 _enable_resource_admission_control: bool
 ```
 
-Each participating operator reports elastic-pool or fixed-gang bundle
-requirements through `PhysicalOperator.resource_admission_spec()`. Claimants
+Disabling the rollback field restores legacy acquisition for both actor pools
+and shuffles. It is not a placement-group-only switch.
+
+Each participating operator reports aggregate minimum resources plus optional
+per-unit resources through `PhysicalOperator.resource_admission_spec()`. Claimants
 are scanned in topological order:
 
 1. every floor that fits is admitted and receives an allocator allocation;
@@ -543,8 +553,9 @@ multiple admitted stages keep streaming concurrently.
 
 The plugin creates ordinary GPU actor pools with statically declared per-actor
 resources. Fixed and autoscaling pool sizes are both eligible. The plugin
-checks capability version 1 and requires every region it creates to report an
-`ELASTIC_POOL` specification, but does not implement a second admission policy.
+checks the exact private specification and grant fields and requires every
+region it creates to report an elastic specification (`unit_resources` is
+present), but does not implement a second admission policy.
 Ray selects all participants across the complete physical DAG, including stock
 and plugin-created pools.
 
@@ -755,9 +766,10 @@ GPU Parquet read
 ```
 
 The CPU operator is a fusion barrier. The GPU read and GPU map are separate
-actor regions governed by Ray's generic admission policy. If both one-actor
-floors fit, they may stream concurrently. Otherwise the downstream region waits
-at or behind the frontier without leapfrogging the earlier claimant.
+actor regions governed by Ray's generic admission policy. If both configured
+minimum-size floors fit, they may stream concurrently. Otherwise the downstream
+region waits at or behind the frontier without leapfrogging the earlier
+claimant.
 
 ### 8.4 Two incompatible GPU regions
 
@@ -837,13 +849,13 @@ execution profile into ordinary Ray remote arguments, including CPUs, one GPU
 per actor, memory, custom resources, placement, runtime environment, actor
 restart policy, and task retry policy.
 
-Each plugin region reports an elastic admission specification with a one-actor
-floor. Ray bounds scaling by its admission grant. Topological
-admitted/frontier/blocked states prevent later pools or gangs from capturing
-capacity needed by the frontier. Pools that become dormant, complete, or
-blocked cancel pending requests and release idle actors; active tasks continue
-normally. Independent stages whose floors fit may run and stream concurrently,
-while Ray Core retains placement authority.
+Each plugin region reports an elastic admission specification with its
+configured minimum-size floor. Ray bounds scaling and submissions with one
+grant. The topological grant scan prevents later pools or gangs from capturing
+capacity needed by the frontier. Pools that receive no usable grant cancel
+pending requests and release idle actors; active tasks continue normally.
+Independent stages whose floors fit may run and stream concurrently, while Ray
+Core retains placement authority.
 
 ## 11. Boundaries and memory behavior
 
@@ -926,8 +938,8 @@ because similarly named methods are present.
 
 The three capabilities are independently identifiable:
 
-- generic resource admission is candidate C and has an
-  internal rollback field;
+- generic resource admission is candidate C and has a whole-controller internal
+  rollback field that restores legacy actor and shuffle acquisition;
 - physical-rule injection is required for any optimizer plugin;
 - the external scan descriptor is required only for direct Parquet GPU reads.
 

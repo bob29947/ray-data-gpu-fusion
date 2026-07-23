@@ -72,7 +72,6 @@ def _assert_wheel_backed_production(venv: Path, layer: str) -> None:
             )
 
     context_module = imported["ray.data.context"]
-    resource_manager = imported["ray.data._internal.execution.resource_manager"]
     actor_pool = imported[
         "ray.data._internal.execution.operators.actor_pool_map_operator"
     ]
@@ -83,18 +82,22 @@ def _assert_wheel_backed_production(venv: Path, layer: str) -> None:
     gpu_shuffle = imported["ray.data._internal.gpu_shuffle.hash_shuffle"]
     parquet = imported["ray.data._internal.datasource.parquet_datasource"]
 
-    if getattr(resource_manager, "RESOURCE_ADMISSION_CONTROL_VERSION", None) != 1:
-        raise RuntimeError("installed Ray lacks resource admission capability v1")
-    if not hasattr(resource_admission, "AdmissionKind"):
-        raise RuntimeError("installed Ray lacks generic resource admission types")
-    if {kind.value for kind in resource_admission.AdmissionKind} != {
-        "elastic_pool",
-        "fixed_gang",
-    }:
-        raise RuntimeError("installed Ray has unexpected resource admission kinds")
+    spec = getattr(resource_admission, "ResourceAdmissionSpec", None)
+    if spec is None or tuple(spec.__dataclass_fields__) != (
+        "minimum_resources",
+        "unit_resources",
+        "min_units",
+        "max_units",
+    ):
+        raise RuntimeError("installed Ray lacks the aggregate admission specification")
+    grant = getattr(resource_admission, "ResourceAdmissionGrant", None)
+    if grant is None or tuple(grant.__dataclass_fields__) != (
+        "max_units",
+        "may_submit",
+    ):
+        raise RuntimeError("installed Ray lacks the aggregate admission grant")
     for hook in (
         "resource_admission_spec",
-        "has_internal_admission_demand",
         "apply_resource_admission_grant",
         "can_release_resource_admission",
     ):

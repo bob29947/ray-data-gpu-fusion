@@ -1,0 +1,179 @@
+# Rendered by benchmark/cloud/run_evidence.py. This tracked template contains
+# no account-specific identifiers or credentials. Never commit a rendered copy.
+cluster_name: __CLUSTER_NAME__
+max_workers: __TOTAL_MAX_WORKERS__
+upscaling_speed: 1.0
+idle_timeout_minutes: 10
+
+provider:
+  type: aws
+  region: __REGION_JSON__
+  availability_zone: __AVAILABILITY_ZONE_JSON__
+  cache_stopped_nodes: false
+
+auth:
+  ssh_user: __SSH_USER_JSON__
+__SSH_PRIVATE_KEY_LINE__
+
+docker:
+  image: __DOCKER_IMAGE_JSON__
+  container_name: ray_gpu_admission_evidence
+  pull_before_run: true
+  run_options:
+    - --shm-size=24gb
+    - --ulimit=nofile=65536:65536
+    - --env=AWS_DEFAULT_REGION=__REGION_RAW__
+    - --volume=/opt/dlami/nvme:/mnt/nvme
+  head_run_options: __HEAD_RUN_OPTIONS_JSON__
+  worker_run_options: ["--gpus=all"]
+
+available_node_types:
+  ray.head.gpu:
+    min_workers: 0
+    max_workers: 0
+    resources: {}
+    node_config: &gpu_node_config
+      InstanceType: __GPU_INSTANCE_TYPE_JSON__
+      ImageId: __AMI_ID_JSON__
+      SubnetIds: [__SUBNET_ID_JSON__]
+      SecurityGroupIds: __SECURITY_GROUP_IDS_JSON__
+      IamInstanceProfile:
+        Arn: __IAM_INSTANCE_PROFILE_ARN_JSON__
+__GPU_KEY_NAME_LINE__
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: __ROOT_VOLUME_GIB__
+            VolumeType: gp3
+      TagSpecifications:
+        - ResourceType: instance
+          Tags: &evidence_tags
+            - {Key: ray-gpu-evidence-project, Value: ray-data-gpu-admission}
+            - {Key: ray-gpu-evidence-run-id, Value: __RUN_ID_JSON__}
+            - {Key: ray-gpu-evidence-arm, Value: __ARM_JSON__}
+            - {Key: ray-gpu-evidence-topology, Value: __TOPOLOGY_JSON__}
+            - {Key: ray-gpu-evidence-cluster, Value: __CLUSTER_NAME__}
+        - ResourceType: volume
+          Tags: *evidence_tags
+  ray.head.cpu:
+    min_workers: 0
+    max_workers: 0
+    resources: {}
+    node_config:
+      InstanceType: __CPU_HEAD_INSTANCE_TYPE_JSON__
+      ImageId: __AMI_ID_JSON__
+      SubnetIds: [__SUBNET_ID_JSON__]
+      SecurityGroupIds: __SECURITY_GROUP_IDS_JSON__
+      IamInstanceProfile:
+        Arn: __IAM_INSTANCE_PROFILE_ARN_JSON__
+__CPU_KEY_NAME_LINE__
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: __ROOT_VOLUME_GIB__
+            VolumeType: gp3
+      TagSpecifications:
+        - ResourceType: instance
+          Tags: *evidence_tags
+        - ResourceType: volume
+          Tags: *evidence_tags
+  ray.worker.gpu:
+    min_workers: __GPU_WORKER_MIN__
+    max_workers: __GPU_WORKER_MAX__
+    resources: {}
+    node_config: *gpu_node_config
+
+head_node_type: __HEAD_NODE_TYPE__
+
+file_mounts:
+  /home/ray/evidence: __HARNESS_DIRECTORY_JSON__
+  /home/ray/wheels: __WHEEL_DIRECTORY_JSON__
+
+rsync_exclude:
+  - __pycache__
+  - "*.pyc"
+
+initialization_commands:
+  - |
+    set -euo pipefail
+    sudo mkdir -p /opt/dlami/nvme
+    INSTANCE_STORE_DEVICE=""
+    for SYS_DEVICE in /sys/block/nvme*n1; do
+      [ -e "$SYS_DEVICE/device/model" ] || continue
+      MODEL=$(tr -d '\000' < "$SYS_DEVICE/device/model" | xargs)
+      [ "$MODEL" = "Amazon EC2 NVMe Instance Storage" ] || continue
+      [ -z "$INSTANCE_STORE_DEVICE" ] || { echo "multiple instance-store devices are unsupported" >&2; exit 1; }
+      INSTANCE_STORE_DEVICE="/dev/$(basename "$SYS_DEVICE")"
+    done
+    if [ -n "$INSTANCE_STORE_DEVICE" ]; then
+      SIZE_BYTES=$(lsblk -bdno SIZE "$INSTANCE_STORE_DEVICE")
+      [ "$SIZE_BYTES" -ge 500000000000 ] || { echo "instance-store NVMe is smaller than 500 GB" >&2; exit 1; }
+      if mountpoint -q /opt/dlami/nvme; then
+        MOUNT_SOURCE=$(findmnt -nro SOURCE --target /opt/dlami/nvme)
+        [ "$(readlink -f "$MOUNT_SOURCE")" = "$(readlink -f "$INSTANCE_STORE_DEVICE")" ] || { echo "unexpected NVMe mount source: $MOUNT_SOURCE" >&2; exit 1; }
+      else
+        ! lsblk -nrpo MOUNTPOINT "$INSTANCE_STORE_DEVICE" | grep -q '[^[:space:]]' || { echo "instance-store NVMe is already mounted elsewhere" >&2; exit 1; }
+        FSTYPE=$(lsblk -dnro FSTYPE "$INSTANCE_STORE_DEVICE")
+        if [ -z "$FSTYPE" ]; then
+          sudo mkfs.ext4 -F -E nodiscard "$INSTANCE_STORE_DEVICE"
+        else
+          [ "$FSTYPE" = ext4 ] || { echo "instance-store NVMe has unexpected filesystem: $FSTYPE" >&2; exit 1; }
+        fi
+        sudo mount -t ext4 -o noatime,nodiratime "$INSTANCE_STORE_DEVICE" /opt/dlami/nvme
+      fi
+      [ "$(findmnt -nro FSTYPE --target /opt/dlami/nvme)" = ext4 ] || { echo "instance-store mount is not ext4" >&2; exit 1; }
+    else
+      IMDS_TOKEN=$(curl --fail --silent --show-error --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+      INSTANCE_TYPE=$(curl --fail --silent --show-error --max-time 5 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+      [ "$INSTANCE_TYPE" = __CPU_HEAD_INSTANCE_TYPE_JSON__ ] || { echo "GPU node has no recognized EC2 instance-store NVMe" >&2; exit 1; }
+      ! mountpoint -q /opt/dlami/nvme || { echo "CPU EBS fallback path is unexpectedly a mountpoint" >&2; exit 1; }
+      ROOT_FSTYPE=$(findmnt -nro FSTYPE --target /opt/dlami/nvme)
+      [ -n "$ROOT_FSTYPE" ] || { echo "CPU EBS fallback is not backed by the root filesystem" >&2; exit 1; }
+      echo "using the existing root EBS filesystem for the CPU-head fallback"
+    fi
+    sudo chmod 1777 /opt/dlami/nvme
+    test -w /opt/dlami/nvme
+
+setup_commands:
+  - test "$(uname -m)" = x86_64
+  - test -x /home/ray/anaconda3/bin/conda
+  - /home/ray/anaconda3/bin/conda create -y -p /home/ray/.envs/rapids-25.12 --file /home/ray/evidence/environment/rapids-25.12-linux-64.explicit.txt
+  - >-
+    /home/ray/.envs/rapids-25.12/bin/python -m pip install
+    --disable-pip-version-check --only-binary=:all:
+    --upgrade-strategy=only-if-needed
+    --report=/home/ray/ray-evidence-pip-report.json
+    -r /home/ray/evidence/benchmark/cloud/aws-runtime.requirements.txt
+    "ray[data,default] @ file:///home/ray/wheels/__RAY_WHEEL_FILE__"
+  - /home/ray/.envs/rapids-25.12/bin/python -m pip check
+  - >-
+    /home/ray/.envs/rapids-25.12/bin/python
+    /home/ray/evidence/benchmark/cloud/preflight.py --local-node-only
+    --arm __ARM_JSON__
+    --expected-wheel-path /home/ray/wheels/__RAY_WHEEL_FILE__
+    --expected-wheel-sha256 __EXPECTED_WHEEL_SHA256__
+    --expected-ray-commit __EXPECTED_RAY_COMMIT__
+    --expected-harness-sha256 __EXPECTED_HARNESS_SHA256__
+    --expected-source-provenance __EXPECTED_SOURCE_PROVENANCE_SHELL__
+
+head_start_ray_commands:
+  - /home/ray/.envs/rapids-25.12/bin/ray stop
+  - mkdir -p /mnt/nvme/ray/spill
+  - /home/ray/.envs/rapids-25.12/bin/ray start --head --port=6379 --autoscaling-config=~/ray_bootstrap_config.yaml --include-dashboard=false --temp-dir=/mnt/nvme/ray --object-store-memory=__OBJECT_STORE_MEMORY_BYTES__ --object-spilling-directory=/mnt/nvme/ray/spill
+
+worker_start_ray_commands:
+  - /home/ray/.envs/rapids-25.12/bin/ray stop
+  - mkdir -p /mnt/nvme/ray/spill
+  - /home/ray/.envs/rapids-25.12/bin/ray start --address=$RAY_HEAD_IP:6379 --temp-dir=/mnt/nvme/ray --object-store-memory=__OBJECT_STORE_MEMORY_BYTES__ --object-spilling-directory=/mnt/nvme/ray/spill

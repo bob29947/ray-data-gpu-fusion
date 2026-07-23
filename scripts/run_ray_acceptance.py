@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -21,7 +22,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV = (ROOT / ".venv").resolve()
-TEST_RAY_ROOT = ROOT / ".worktrees" / "ray-pr-candidate" / "python" / "ray"
+CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-minimal"
+CANDIDATE_BRANCH = "codex/gpu-admission-minimal"
+TEST_RAY_ROOT = CANDIDATE_WORKTREE / "python" / "ray"
 BOOTSTRAP = ROOT / "scripts" / "ray_acceptance_bootstrap"
 
 SPILL_TEST = (
@@ -83,6 +86,55 @@ def _verify_wheel_pin(wheel: Path, manifest_name: str, expected_layer: str) -> N
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     if digest != manifest.get("wheel_sha256"):
         raise RuntimeError(f"{wheel} hash does not match pins/{manifest_name}")
+
+
+def _git(*args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(CANDIDATE_WORKTREE), *args], text=True
+    ).strip()
+
+
+def _verify_candidate_test_worktree() -> None:
+    """Bind acceptance test sources to the finalized candidate manifest."""
+    manifest = json.loads((ROOT / "pins" / "pr-candidate.json").read_text())
+    if not isinstance(manifest, dict):
+        raise RuntimeError("candidate manifest must contain a JSON object")
+    if manifest.get("schema_version") != 1 or manifest.get("layer") != "pr-candidate":
+        raise RuntimeError("candidate manifest has the wrong schema or layer")
+    expected_head = manifest.get("local_commit")
+    expected_tree = manifest.get("source_tree")
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+    ):
+        raise RuntimeError("candidate manifest has no valid local commit")
+    if (
+        not isinstance(expected_tree, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_tree) is None
+    ):
+        raise RuntimeError("candidate manifest has no valid source tree")
+    if not CANDIDATE_WORKTREE.is_dir():
+        raise RuntimeError(
+            f"candidate Ray test worktree is missing: {CANDIDATE_WORKTREE}"
+        )
+    status = _git("status", "--porcelain")
+    if status:
+        raise RuntimeError(f"candidate Ray test worktree must be clean:\n{status}")
+    branch = _git("symbolic-ref", "--short", "HEAD")
+    if branch != CANDIDATE_BRANCH:
+        raise RuntimeError(
+            f"candidate test branch {branch!r} != required {CANDIDATE_BRANCH!r}"
+        )
+    head = _git("rev-parse", "HEAD")
+    if head != expected_head:
+        raise RuntimeError(
+            f"candidate test HEAD {head} != manifest commit {expected_head}"
+        )
+    tree = _git("rev-parse", "HEAD^{tree}")
+    if tree != expected_tree:
+        raise RuntimeError(
+            f"candidate test tree {tree} != manifest tree {expected_tree}"
+        )
 
 
 def _install(wheel: Path) -> None:
@@ -227,8 +279,7 @@ def main() -> int:
     try:
         _verify_wheel_pin(candidate, "pr-candidate.json", "pr-candidate")
         _require_test_prerequisites()
-        if not TEST_RAY_ROOT.is_dir():
-            raise RuntimeError(f"candidate Ray test tree is missing: {TEST_RAY_ROOT}")
+        _verify_candidate_test_worktree()
         _install(candidate)
         _assert_layer("candidate")
         _run_tests("candidate", skip_spill=args.skip_spill)
