@@ -125,6 +125,114 @@ def test_materialize_boundaries_are_opt_in(tmp_path: Path) -> None:
     ).materialize_boundaries
 
 
+def test_aggregate_cpu_gap_is_a_supported_workload(tmp_path: Path) -> None:
+    arguments = _arguments(tmp_path)
+    arguments[arguments.index("incident")] = "aggregate-cpu-gap"
+
+    args = workload.parse_args(arguments)
+
+    assert args.workload == "aggregate-cpu-gap"
+    assert workload._expected_downstream_actor_counts(args) == {
+        "gpu-map-final-add-one": 4
+    }
+
+
+def test_aggregate_cpu_gap_exact_oracle() -> None:
+    baseline = workload._expected_sums(rows=10, groups=3)
+
+    assert workload._expected_group_output(10, 3, "incident") == baseline
+    assert workload._expected_group_output(10, 3, "aggregate-cpu-gap") == {
+        key: 2 * value + 1 for key, value in baseline.items()
+    }
+
+
+def _physical_plan(*operators: tuple[str, str]) -> dict[str, object]:
+    return {
+        "dag": "test",
+        "operators": [
+            {"class": operator_class, "name": operator_name}
+            for operator_class, operator_name in operators
+        ],
+    }
+
+
+def test_aggregate_cpu_gap_requires_exact_physical_owner_chain() -> None:
+    plans = [
+        _physical_plan(
+            ("InputDataBuffer", "Input"),
+            ("TaskPoolMapOperator", "ReadRange"),
+            ("ActorPoolMapOperator", "Project"),
+            (
+                "GPUHashAggregateOperator",
+                "GPUHashAggregate(key_columns=('key',), num_partitions=4)",
+            ),
+            ("TaskPoolMapOperator", "Project"),
+            ("ActorPoolMapOperator", "MapBatches(AddOne)"),
+        )
+    ]
+    workload._validate_evidence_plan(
+        "aggregate-cpu-gap",
+        plans,
+        "GPUHashAggregate(key_columns=('key',))",
+    )
+    with pytest.raises(AssertionError, match="physical operator layout changed"):
+        workload._validate_evidence_plan(
+            "aggregate-cpu-gap",
+            [
+                _physical_plan(
+                    ("InputDataBuffer", "Input"),
+                    ("TaskPoolMapOperator", "ReadRange"),
+                    ("ActorPoolMapOperator", "Project"),
+                    ("GPUHashAggregateOperator", "GPUHashAggregate(key_columns=())"),
+                    ("TaskPoolMapOperator", "Unexpected"),
+                    ("TaskPoolMapOperator", "Project"),
+                    ("ActorPoolMapOperator", "MapBatches(AddOne)"),
+                )
+            ],
+        )
+    with pytest.raises(AssertionError, match="refusing CPU fallback"):
+        workload._validate_evidence_plan("aggregate-cpu-gap", plans, "HashAggregate")
+    workload._validate_evidence_plan("incident", [], "HashAggregate")
+
+
+def test_aggregate_cpu_gap_accepts_exact_materialized_layout() -> None:
+    plans = [
+        _physical_plan(
+            ("InputDataBuffer", "Input"),
+            ("TaskPoolMapOperator", "ReadRange"),
+            ("ActorPoolMapOperator", "Project"),
+        ),
+        _physical_plan(
+            ("InputDataBuffer", "Input"),
+            ("GPUHashAggregateOperator", "GPUHashAggregate(key_columns=())"),
+        ),
+        _physical_plan(
+            ("InputDataBuffer", "Input"),
+            ("TaskPoolMapOperator", "Project"),
+            ("ActorPoolMapOperator", "MapBatches(AddOne)"),
+        ),
+    ]
+
+    workload._validate_evidence_plan("aggregate-cpu-gap", plans)
+
+
+def test_aggregate_output_rejects_duplicate_keys() -> None:
+    with pytest.raises(AssertionError, match="duplicate key 0"):
+        workload._unique_group_output([{"key": 0, "id": 1}, {"key": 0, "id": 1}])
+    assert workload._unique_group_output(
+        [{"key": 0, "id": 1}, {"key": 1, "id": 2}]
+    ) == {0: 1, 1: 2}
+
+
+def test_add_one_stage_is_classified_as_downstream_gpu_actor() -> None:
+    assert workload._stage_classification("gpu-map-final-add-one") == (
+        3,
+        "post-shuffle-map-batches",
+    )
+    assert workload._stage_operator("gpu-map-final-add-one") == "AddOne/map_batches"
+    assert workload._stage_actor_class_fragment("gpu-map-final-add-one") == "AddOne"
+
+
 def test_stopped_sampler_cannot_recreate_gpu_monitors() -> None:
     class ForbiddenLock:
         def acquire(self, **_kwargs):

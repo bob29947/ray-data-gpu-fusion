@@ -24,7 +24,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -148,6 +148,36 @@ class AddKey(_ProgressUdf):
             # Synchronize so its device work cannot escape the measured UDF stage.
             cp.cuda.get_current_stream().synchronize()
         result["key"] = result["id"] % self._groups
+        self._record(result)
+        return result
+
+
+class AddKeyColumn(_ProgressUdf):
+    """Typed expression UDF that keeps the aggregate input schema static."""
+
+    def __init__(
+        self,
+        groups: int,
+        gpu_work_iterations: int,
+        progress: object,
+        stage: str,
+    ):
+        super().__init__(progress, stage)
+        self._groups = groups
+        self._gpu_work_iterations = gpu_work_iterations
+
+    def __call__(self, values):
+        import cupy as cp
+        import pyarrow as pa
+
+        self._input(values)
+        ids = cp.asarray(values.to_numpy(zero_copy_only=False), dtype=cp.int64)
+        if self._gpu_work_iterations:
+            scratch = ids.astype(cp.float32)
+            for _ in range(self._gpu_work_iterations):
+                scratch = cp.sin(scratch * cp.float32(1e-6) + cp.float32(0.1))
+        keys = cp.remainder(ids, cp.int64(self._groups))
+        result = pa.array(cp.asnumpy(keys))
         self._record(result)
         return result
 
@@ -1300,6 +1330,8 @@ def _stage_classification(stage: str) -> tuple[int, str]:
         return 2, "post-shuffle-map-groups"
     if stage == "gpu-map-final":
         return 3, "post-shuffle-map-batches"
+    if stage == "gpu-map-final-add-one":
+        return 3, "post-shuffle-map-batches"
     match = re.fullmatch(r"gpu-map-(\d+)", stage)
     if match:
         return int(match.group(1)) - 1, "sequential-map-batches"
@@ -1311,6 +1343,8 @@ def _stage_operator(stage: str) -> str:
         return "SumGroup/map_groups"
     if stage == "gpu-map-final":
         return "Identity/map_batches"
+    if stage == "gpu-map-final-add-one":
+        return "AddOne/map_batches"
     return "map_batches"
 
 
@@ -1319,6 +1353,8 @@ def _stage_actor_class_fragment(stage: str) -> str:
         return "SumGroup"
     if stage == "gpu-map-final":
         return "Identity"
+    if stage == "gpu-map-final-add-one":
+        return "AddOne"
     return ""
 
 
@@ -1880,6 +1916,108 @@ def _expected_sums(rows: int, groups: int) -> dict[int, int]:
     return expected
 
 
+def _expected_group_output(rows: int, groups: int, workload: str) -> dict[int, int]:
+    expected = _expected_sums(rows, groups)
+    if workload == "aggregate-cpu-gap":
+        return {key: 2 * value + 1 for key, value in expected.items()}
+    return expected
+
+
+def _physical_plan_document(dataset: object) -> dict[str, object]:
+    import copy
+
+    from ray.data._internal.logical.optimizers import get_execution_plan
+
+    logical_plan = copy.copy(dataset._logical_plan)
+    physical_plan, _ = get_execution_plan(logical_plan)
+    operators = [
+        {"class": type(operator).__name__, "name": operator.name}
+        for operator in physical_plan.dag.post_order_iter()
+    ]
+    return {"dag": physical_plan.dag.dag_str, "operators": operators}
+
+
+_AGGREGATE_CPU_GAP_STREAMING_LAYOUT = (
+    (
+        ("InputDataBuffer", "Input"),
+        ("TaskPoolMapOperator", "ReadRange"),
+        ("ActorPoolMapOperator", "Project"),
+        ("GPUHashAggregateOperator", "GPUHashAggregate"),
+        ("TaskPoolMapOperator", "Project"),
+        ("ActorPoolMapOperator", "MapBatches(AddOne)"),
+    ),
+)
+_AGGREGATE_CPU_GAP_MATERIALIZED_LAYOUT = (
+    (
+        ("InputDataBuffer", "Input"),
+        ("TaskPoolMapOperator", "ReadRange"),
+        ("ActorPoolMapOperator", "Project"),
+    ),
+    (
+        ("InputDataBuffer", "Input"),
+        ("GPUHashAggregateOperator", "GPUHashAggregate"),
+    ),
+    (
+        ("InputDataBuffer", "Input"),
+        ("TaskPoolMapOperator", "Project"),
+        ("ActorPoolMapOperator", "MapBatches(AddOne)"),
+    ),
+)
+
+
+def _physical_plan_layout(
+    physical_plans: Sequence[dict[str, object]],
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    layout = []
+    for plan in physical_plans:
+        operators = []
+        for operator in plan["operators"]:
+            operator_class = str(operator["class"])
+            operator_name = str(operator["name"])
+            if (
+                operator_class == "GPUHashAggregateOperator"
+                and operator_name.startswith("GPUHashAggregate(")
+            ):
+                operator_name = "GPUHashAggregate"
+            operators.append((operator_class, operator_name))
+        layout.append(tuple(operators))
+    return tuple(layout)
+
+
+def _validate_evidence_plan(
+    workload: str,
+    physical_plans: Sequence[dict[str, object]],
+    dataset_stats: str | None = None,
+) -> None:
+    if workload != "aggregate-cpu-gap":
+        return
+    layout = _physical_plan_layout(physical_plans)
+    if layout not in {
+        _AGGREGATE_CPU_GAP_STREAMING_LAYOUT,
+        _AGGREGATE_CPU_GAP_MATERIALIZED_LAYOUT,
+    }:
+        raise AssertionError(
+            "aggregate-cpu-gap physical operator layout changed: expected "
+            f"{_AGGREGATE_CPU_GAP_STREAMING_LAYOUT} or "
+            f"{_AGGREGATE_CPU_GAP_MATERIALIZED_LAYOUT}, got {layout}"
+        )
+    if dataset_stats is not None and "GPUHashAggregate(" not in dataset_stats:
+        raise AssertionError(
+            "aggregate-cpu-gap did not execute GPUHashAggregate; refusing CPU "
+            "fallback as fused-GPU evidence"
+        )
+
+
+def _unique_group_output(rows: list[dict[str, object]]) -> dict[int, int]:
+    output = {}
+    for row in rows:
+        key = int(row["key"])
+        if key in output:
+            raise AssertionError(f"aggregate output contains duplicate key {key}")
+        output[key] = int(row["id"])
+    return output
+
+
 def _output_digest(rows: list[dict[str, object]]) -> str:
     normalized = sorted(
         ({"key": int(row["key"]), "id": int(row["id"])} for row in rows),
@@ -2004,6 +2142,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         choices=(
             "incident",
+            "aggregate-cpu-gap",
             "actor-only",
             "map-heavy",
             "shuffle-heavy",
@@ -2103,22 +2242,28 @@ def _expected_downstream_actor_counts(
         return {}
     if args.workload not in {
         "incident",
+        "aggregate-cpu-gap",
         "shuffle-heavy",
         "forced-spill",
         "failure-cleanup",
     }:
         return {}
     count = int(args.map_actors_min)
-    expected = {
-        "gpu-map-groups-1": count,
-        "gpu-map-final": count,
-    }
+    if args.workload == "aggregate-cpu-gap":
+        return {"gpu-map-final-add-one": count}
+    expected = {"gpu-map-groups-1": count, "gpu-map-final": count}
     if args.workload == "shuffle-heavy":
         expected["gpu-map-groups-2"] = count
     return expected
 
 
-def _build_dataset(args: argparse.Namespace, progress: object):
+def _build_dataset(
+    args: argparse.Namespace,
+    progress: object,
+    materialization_checkpoint: (
+        Callable[[list[dict[str, object]]], None] | None
+    ) = None,
+):
     import ray.data
 
     strategy = _actor_pool_strategy(args)
@@ -2127,10 +2272,18 @@ def _build_dataset(args: argparse.Namespace, progress: object):
     def materialize_boundary(dataset, stage: str):
         if not args.materialize_boundaries:
             return dataset
+        phase = {
+            "stage": stage,
+            "physical_plan": _physical_plan_document(dataset),
+        }
+        materialization_phases.append(phase)
+        if materialization_checkpoint is not None:
+            materialization_checkpoint(materialization_phases)
         started = time.monotonic()
         materialized = dataset.materialize()
-        materialization_phases.append(
-            {"stage": stage, "materialize_s": time.monotonic() - started}
+        phase.update(
+            materialize_s=time.monotonic() - started,
+            dataset_stats=materialized.stats(),
         )
         return materialized
 
@@ -2175,6 +2328,39 @@ def _build_dataset(args: argparse.Namespace, progress: object):
         return (
             gpu_map(left.union(right), Identity, "gpu-map-fan-in"),
             "row-count",
+            materialization_phases,
+        )
+
+    if args.workload == "aggregate-cpu-gap":
+        from ray.data.aggregate import Sum
+        from ray.data.datatype import DataType
+        from ray.data.expressions import col, udf
+
+        add_key = udf(return_dtype=DataType.int64())(AddKeyColumn)(
+            args.groups,
+            args.gpu_map_work_iterations,
+            progress,
+            "gpu-map-add-key",
+        )
+        dataset = source.with_column(
+            "key",
+            add_key(col("id")),
+            compute=strategy,
+            num_cpus=0,
+            num_gpus=1,
+        )
+        dataset = materialize_boundary(dataset, "upstream-gpu-key")
+        groupby_kwargs = (
+            {} if args.shuffle_ranks is None else {"num_partitions": args.shuffle_ranks}
+        )
+        dataset = dataset.groupby("key", **groupby_kwargs).aggregate(
+            Sum("id", alias_name="id")
+        )
+        dataset = materialize_boundary(dataset, "gpu-hash-aggregate")
+        dataset = dataset.with_column("id", col("id") * 2, num_cpus=1, num_gpus=0)
+        return (
+            gpu_map(dataset, AddOne, "gpu-map-final-add-one"),
+            "scaled-group-sum",
             materialization_phases,
         )
 
@@ -2344,14 +2530,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         sampler.start()
         with document_lock:
             document["status"] = "building"
+
+        def checkpoint_materialization_phases(
+            phases: list[dict[str, object]],
+        ) -> None:
+            phase_snapshot = [dict(phase) for phase in phases]
+            phase_plans = [
+                phase["physical_plan"]
+                for phase in phase_snapshot
+                if "physical_plan" in phase
+            ]
+            with document_lock:
+                document["materialization_phases"] = phase_snapshot
+                document["evidence_physical_plans"] = phase_plans
+                document["evidence_plan_validation"] = {
+                    "required": args.workload == "aggregate-cpu-gap",
+                    "status": "partial",
+                    "operator_layout": _physical_plan_layout(phase_plans),
+                }
+                _atomic_json(args.result, document)
+
         build_started = time.monotonic()
-        dataset, oracle, materialization_phases = _build_dataset(args, progress)
+        dataset, oracle, materialization_phases = _build_dataset(
+            args,
+            progress,
+            checkpoint_materialization_phases,
+        )
+        terminal_physical_plan = _physical_plan_document(dataset)
+        evidence_physical_plans = [
+            phase["physical_plan"]
+            for phase in materialization_phases
+            if "physical_plan" in phase
+        ]
+        evidence_physical_plans.append(terminal_physical_plan)
+        _validate_evidence_plan(args.workload, evidence_physical_plans)
+        evidence_plan_validation = {
+            "required": args.workload == "aggregate-cpu-gap",
+            "status": "passed",
+            "operator_layout": _physical_plan_layout(evidence_physical_plans),
+        }
         demand_started_s = time.monotonic() - workload_started
         demand_started_at = _utc_now()
         with document_lock:
             document["build_s"] = time.monotonic() - build_started
             document["logical_dataset"] = repr(dataset)
             document["materialization_phases"] = materialization_phases
+            document["evidence_physical_plans"] = evidence_physical_plans
+            document["evidence_plan_validation"] = evidence_plan_validation
             document["status"] = "materializing"
             document["workload_demand_started_s"] = demand_started_s
             document["workload_demand_started_at"] = demand_started_at
@@ -2402,17 +2627,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         validation_started = time.monotonic()
         schema = _schema_document(materialized)
-        if oracle == "group-sum":
+        if oracle in {"group-sum", "scaled-group-sum"}:
             output = materialized.take_all()
-            actual = {int(row["key"]): int(row["id"]) for row in output}
-            expected = _expected_sums(args.rows, args.groups)
+            actual = _unique_group_output(output)
+            expected = _expected_group_output(args.rows, args.groups, args.workload)
             if actual != expected:
                 raise AssertionError(
                     f"aggregate oracle mismatch: expected {expected}, got {actual}"
                 )
             output_rows = len(output)
             output_digest = _output_digest(output)
-            content_oracle = {"kind": "exact-group-sum", "sha256": output_digest}
+            content_oracle = {
+                "kind": (
+                    "exact-scaled-group-sum"
+                    if oracle == "scaled-group-sum"
+                    else "exact-group-sum"
+                ),
+                "sha256": output_digest,
+            }
         else:
             actual_fingerprint = _actual_row_fingerprint(materialized)
             expected_fingerprint = _expected_row_fingerprint(_expected_row_ranges(args))
@@ -2428,6 +2660,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "actual": actual_fingerprint,
                 "expected": expected_fingerprint,
             }
+        dataset_stats = materialized.stats()
+        phase_stats = "\n".join(
+            str(phase.get("dataset_stats", "")) for phase in materialization_phases
+        )
+        _validate_evidence_plan(
+            args.workload,
+            evidence_physical_plans,
+            f"{phase_stats}\n{dataset_stats}",
+        )
         summary = materialized.get_stats_summary()
         global_bytes_spilled = int(getattr(summary, "global_bytes_spilled", 0))
         global_bytes_restored = int(getattr(summary, "global_bytes_restored", 0))
@@ -2453,7 +2694,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 input_rows_per_second=args.rows / completion_s,
                 global_bytes_spilled=global_bytes_spilled,
                 global_bytes_restored=global_bytes_restored,
-                dataset_stats=materialized.stats(),
+                dataset_stats=dataset_stats,
             )
         return 0
     except TerminationRequested:

@@ -98,6 +98,31 @@ recorded `--seed`, and each case records the wheel/commit/hash, physical GPU
 selection, preflight allocation, workload telemetry, correctness oracle,
 timeout classification, job cleanup, and cluster process cleanup.
 
+The focused future-fusion proxy can be run without the full matrix:
+
+```bash
+.venv/bin/python benchmark/local/run_evidence.py \
+  --run-id aggregate-cpu-gap-g4-r4-v1 \
+  --arms stock,minimal \
+  --capacities 4 \
+  --workloads aggregate-cpu-gap \
+  --ranks 4 \
+  --map-actors-per-stage 1 \
+  --map-actors-max-per-stage 4 \
+  --repetitions 1 \
+  --gpu-indices 0,1,2,3 \
+  --rows 16000000 \
+  --blocks 32 \
+  --case-timeout-seconds 180 \
+  --execute-local
+```
+
+Its physical shape is GPU actor key creation, fused GPU hash
+shuffle/aggregation, a CPU expression map, and a real downstream GPU `AddOne`
+actor. The harness snapshots and validates that optimized operator sequence
+before execution, and the exact-output oracle checks `2 * sum(id) + 1` for
+every unique group key.
+
 For the focused performance gate, `--profile scale` defaults to five randomized
 repetition blocks at four billion rows and 1,024 blocks. The keyed dataset has a
 64 GB logical lower bound before cuDF and shuffle overhead and exceeds the 8 GiB

@@ -58,11 +58,20 @@ autoscaler from 1 through 4 GPUs; and a CPU-head cold autoscaler from 0 through
 omitted. This directly tests the claim that lowering shuffle rank count is an
 adequate workaround.
 
-Available workload shapes are `incident`, `actor-only`, `map-heavy`,
-`shuffle-heavy`, `forced-spill`, and `fan-in`. The incident is the physical
-owner chain from the candidate acceptance test: GPU actor pool, complete GPU
-shuffle gang, GPU `map_groups` actor pool, and a final GPU actor pool. Its
-aggregate demand exceeds the fleet while each minimum progress floor fits.
+Available workload shapes are `incident`, `aggregate-cpu-gap`, `actor-only`,
+`map-heavy`, `shuffle-heavy`, `forced-spill`, `fan-in`, and
+`failure-cleanup`. The incident is the physical owner chain from the candidate
+acceptance test: GPU actor pool, complete GPU shuffle gang, GPU `map_groups`
+actor pool, and a final GPU actor pool. Its aggregate demand exceeds the fleet
+while each minimum progress floor fits.
+
+`aggregate-cpu-gap` is the future-fusion proxy. It uses a typed GPU actor
+expression to create the key, the native `GPUHashAggregateOperator` to combine
+shuffle and reduction in one rank gang, an ordinary CPU projection, and a
+nontrivial downstream GPU `AddOne` actor. The workload refuses to count a run
+as evidence unless its pre-execution optimized plan has that exact operator
+sequence. A completing run must also report `GPUHashAggregate(` in runtime
+stats, preventing a silent CPU-aggregate fallback.
 
 The defaults deliberately render the complete matrix and five repetitions;
 that is a large and expensive campaign. Inspect the case count and stage small

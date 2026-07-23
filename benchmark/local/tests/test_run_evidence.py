@@ -224,6 +224,11 @@ def test_rank_filter_omits_values_above_capacity() -> None:
         2,
         "default",
     ]
+    assert run_evidence._ranks_for("aggregate-cpu-gap", 2, [1, 2, 3, 4, "default"]) == [
+        1,
+        2,
+        "default",
+    ]
     assert run_evidence._ranks_for("actor-only", 2, [1, 2]) == ["default"]
 
 

@@ -619,7 +619,7 @@ def test_matrix_skips_ranks_above_topology_capacity() -> None:
         run_id="matrix-test",
         arms=("stock",),
         topologies=("fixed-1", "fixed-2"),
-        workloads=("incident", "fan-in"),
+        workloads=("incident", "aggregate-cpu-gap", "fan-in"),
         ranks=(1, 2, 3, 4, "default"),
         repetitions=1,
     )
@@ -632,7 +632,19 @@ def test_matrix_skips_ranks_above_topology_capacity() -> None:
         ("fixed-2", 2),
         ("fixed-2", "default"),
     }
-    assert {case.workload for case in cases} == {"incident", "fan-in"}
+    aggregate = [case for case in cases if case.workload == "aggregate-cpu-gap"]
+    assert {(case.topology, case.shuffle_ranks) for case in aggregate} == {
+        ("fixed-1", 1),
+        ("fixed-1", "default"),
+        ("fixed-2", 1),
+        ("fixed-2", 2),
+        ("fixed-2", "default"),
+    }
+    assert {case.workload for case in cases} == {
+        "incident",
+        "aggregate-cpu-gap",
+        "fan-in",
+    }
     fan_in = [case for case in cases if case.workload == "fan-in"]
     assert {case.shuffle_ranks for case in fan_in} == {"default"}
 

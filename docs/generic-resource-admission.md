@@ -19,9 +19,10 @@ output backpressure and partial resource acquisition can form a deadlock.
 This PR adds a small internal resource-admission contract to
 `PhysicalOperator`. Operators describe an aggregate minimum progress floor and,
 when elastic, the resource cost of one usable unit. A topological controller
-admits the maximal prefix of operators whose floors fit, prevents later
-operators from leapfrogging the first non-fitting frontier, and grants excess
-resources only after every admitted floor is protected.
+admits the maximal topological prefix of current claimants whose floors fit,
+subject to the protected closure of sticky owners. It prevents later claimants
+from leapfrogging the first non-fitting frontier and grants excess resources
+only after every admitted floor is protected.
 
 The production adapters in this PR cover:
 
@@ -33,9 +34,11 @@ The production adapters in this PR cover:
 
 The aggregate contract could be implemented by future physical operators, but
 this PR does not wire production GPU task admission. GPU tasks and undeclared
-GPU operators retain legacy scheduling. When a topology combines a declared
-owner with an adapter whose constraints cannot be represented, the controller
-emits one warning and makes the whole topology legacy to avoid mixed ownership.
+GPU operators remain outside admission. When a topology combines a declared
+owner with a recognized adapter constraint that cannot be represented, the
+controller emits one warning and clears every declared specification to avoid
+partially applying the ownership policy. Actor pools then acquire eagerly and
+candidate shuffle gangs retain eager atomic placement-group behavior.
 
 No public Dataset API or Ray Core change is required.
 
@@ -89,13 +92,14 @@ allocator assigns it two GPUs.
 
 ### Why Ray Core cannot solve the cycle
 
-Ray Core correctly schedules individual actors, tasks, and placement groups.
-It does not know:
+Ray Core correctly schedules individual actors, tasks, and submitted placement
+groups. It cannot infer:
 
 - which resource requests belong to one Ray Data physical DAG;
 - which operator is an unfinished ancestor of another operator;
 - which streaming edge is blocked by output backpressure;
-- which complete group of workers is required for operator progress; or
+- that independently submitted workers form one complete progress group unless
+  Ray Data encodes them in a placement group; or
 - when an otherwise healthy actor should be released so another physical stage
   can run.
 
@@ -135,8 +139,8 @@ remaining capacity for performance.
 - Let upstream Arrow output queue or spill so an operator can finish and
   release its GPUs before a downstream stage starts.
 - Support fractional CPU/GPU declarations, explicit execution limits, and
-  cluster autoscaling, while preserving stock scheduling for constraints the
-  aggregate model cannot represent.
+  cluster autoscaling, while falling back to eager candidate behavior for
+  recognized constraints the aggregate model cannot represent.
 - Provide an internal extension point for future GPU tasks, sorts, joins, and
   other physical operators without adding controller type checks.
 
@@ -234,17 +238,20 @@ operator-type branches for map, shuffle, aggregate, or `map_groups`.
 
 If any otherwise-managed topology contains an adapter whose resource envelope
 cannot be represented safely, the controller emits one topology warning,
-clears all admission specifications, and retains stock scheduling for the
-whole topology. Examples include dynamic actor options, custom resources,
-label selectors, and unsupported placement strategies. Undeclared operators
-are otherwise unchanged; the controller does not guess their semantics.
+clears all admission specifications, and retains eager placement-group-only
+behavior for the whole topology. Examples detected by the current actor-pool
+and shuffle adapters include dynamic actor options, custom resources, label
+selectors, and unsupported placement strategies. Undeclared operators are
+otherwise unchanged and outside the admission guarantee; the controller does
+not guess their semantics.
 
 `DataContext._enable_resource_admission_control` defaults to true and is backed
 by `RAY_DATA_ENABLE_RESOURCE_ADMISSION_CONTROL`. Setting it to false makes the
-current actor and shuffle adapters use legacy acquisition and therefore removes
-the admission deadlock guarantee. This is a whole-controller rollback: actor
-pools revert to eager legacy acquisition too, so it is not a
-placement-group-only switch.
+controller ignore the current specifications and therefore removes the
+topological admission guarantee. Actor pools return to eager acquisition; the
+candidate's shuffle still uses its atomic placement group but activates it
+eagerly. This is the placement-group-only ablation used by the evidence
+harness, not behavior identical to the unmodified stock wheel.
 
 ## Controller and executor lifecycle
 
@@ -268,9 +275,11 @@ input, internal input, active work, pending resources, or owned resources.
 Every still-relevant declared ancestor of a direct participant is added, even
 across non-participating CPU operators.
 
-The direct successor of a draining fixed gang may prewarm its actor floor while
-shuffle extraction finishes. This is deliberately one hop only; later stages
-do not recursively acquire GPUs before they have input.
+A declared single-input direct successor of a fixed gang may expose its floor
+after the gang's inputs complete while the gang is still draining or
+extracting. This prewarms a Core request, not guaranteed resource ownership.
+It is deliberately one hop only; later stages do not recursively request GPUs
+before they have input.
 
 Admission completion is intentionally narrower than
 `has_execution_finished()`. An upstream operator can have buffered Arrow output
@@ -292,7 +301,8 @@ target, so a pool cannot justify excess actors merely by already owning them.
 
 Admission floors remain enabled when
 `op_resource_reservation_enabled=False`. In that mode, proportional sharing is
-absent and admitted elastic pools receive their minimum unit count.
+absent; the first admitted elastic pool can receive topological spare capacity
+above its floor, while later admitted pools retain their protected floors.
 
 If any floor fits explicit execution limits but is larger than current cluster
 capacity, the frontier receives its minimum unit count solely to create a
@@ -327,7 +337,7 @@ floor while Ray Core restores capacity, fails the owner, or the chain drains.
 `unit_resources` is one actor's CPU/GPU/memory cost. The floor is that cost
 times the configured minimum pool size, and `max_units` is the configured pool
 maximum (or unbounded for an infinite pool). Dynamic or constrained resources
-fall back to the stock lifecycle with a warning.
+trigger the whole-topology admission fallback with a warning.
 
 The adapter behavior is:
 
@@ -462,7 +472,7 @@ kept only the lifecycle needed for liveness and cleanup.
 
 - Production GPU task admission is not wired yet.
 - Dynamic per-actor resource callbacks have no trustworthy static envelope and
-  therefore retain legacy scheduling.
+  therefore trigger the whole-topology admission fallback.
 - Undeclared GPU operators retain stock behavior, so the deadlock guarantee
   covers declared participants only.
 - Placement-group provisioning follows Ray's scheduler and autoscaler and is
@@ -471,6 +481,7 @@ kept only the lifecycle needed for liveness and cleanup.
   impossible rank can remain pending like other infeasible Ray requests.
 - Admission capacity uses aggregate `ExecutionResources`; constrained custom
   resources, label selectors, and unsupported placement strategies therefore
-  fall back to stock scheduling rather than claiming an unproven guarantee.
+  trigger eager placement-group-only behavior rather than claiming an unproven
+  guarantee.
 - The contract is private and deliberately has no version/public compatibility
   promise; the candidate wheel is checked by exact grant fields and provenance.

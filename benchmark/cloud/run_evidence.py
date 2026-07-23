@@ -271,6 +271,7 @@ ARMS = {
 
 WORKLOADS = (
     "incident",
+    "aggregate-cpu-gap",
     "actor-only",
     "map-heavy",
     "shuffle-heavy",
@@ -280,7 +281,13 @@ WORKLOADS = (
 )
 
 SHUFFLE_WORKLOADS = frozenset(
-    {"incident", "shuffle-heavy", "forced-spill", "failure-cleanup"}
+    {
+        "incident",
+        "aggregate-cpu-gap",
+        "shuffle-heavy",
+        "forced-spill",
+        "failure-cleanup",
+    }
 )
 EXPECTED_FAILURE_WORKLOADS = frozenset({"failure-cleanup"})
 NORMAL_OBJECT_STORE_BYTES = 8 * 1024**3

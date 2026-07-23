@@ -74,6 +74,7 @@ DGX_MIN_CPUS = 64
 ARM_NAMES = ("stock", "pg-only", "minimal", "prototype")
 WORKLOADS = (
     "incident",
+    "aggregate-cpu-gap",
     "actor-only",
     "map-heavy",
     "shuffle-heavy",
@@ -82,7 +83,13 @@ WORKLOADS = (
     "failure-cleanup",
 )
 SHUFFLE_WORKLOADS = frozenset(
-    {"incident", "shuffle-heavy", "forced-spill", "failure-cleanup"}
+    {
+        "incident",
+        "aggregate-cpu-gap",
+        "shuffle-heavy",
+        "forced-spill",
+        "failure-cleanup",
+    }
 )
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 LOCAL_STAGED_HARNESS_FILES = (
