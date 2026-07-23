@@ -11,11 +11,17 @@ This directory contains the compact evidence bundle referenced by
   audit for Ray candidate `31d4448482c1a47e034e9160d1d8f41e84cd1a25`.
 - `scale-evidence-report.json` is the directly browsable four-GPU scale and
   rank-control summary.
+- `compute-heavy-evidence-v1.json` is the compact result and provenance summary
+  for the successful 16-GPU output-bearing compute sensitivity.
+- `dgx-compute-heavy-v1.tar.gz` contains the unmodified plan, staged-harness
+  manifest, per-arm execution records, preflights, and cleanup proofs for that
+  compute-heavy pair.
 
-Archive SHA-256:
+Archive SHA-256 values:
 
 ```text
-9f12f53db1abe78c6b200b22e399c583f5c8599e19db498a44f38a203171725b
+dgx-screening-v1.tar.gz       9f12f53db1abe78c6b200b22e399c583f5c8599e19db498a44f38a203171725b
+dgx-compute-heavy-v1.tar.gz  f39d7d1f5378909e4d199b254487ae646c7fc81e2d369161fe0acd4135398326
 ```
 
 Each archived experiment includes its rendered `plan.json`, prerequisite
@@ -36,6 +42,7 @@ along with the executed commands, preflight result, and cleanup result.
 | 16-GPU incident materialization control | `perf16-final-stock-materialize-r7-w0-v1` |
 | 16-GPU native aggregate: stock, placement groups, admission | `agg-gap-perf16-r7-v1` |
 | 16-GPU native aggregate materialization control | `agg-gap-stock-mat16-r7-v1` |
+| 16-GPU output-bearing compute sensitivity | `fused16-r7-w131k-b2m-bl256-pair-v2` in `dgx-compute-heavy-v1.tar.gz` |
 | Small rank-tuning control | `stock-workaround-16m-20260722a` |
 | Billion-row rank/OOM and safe actor-only controls | `perf4-1b-v1` |
 | Shuffle-free actor lifecycle control | `local-multigpu-actor-baseline-20260722a` |

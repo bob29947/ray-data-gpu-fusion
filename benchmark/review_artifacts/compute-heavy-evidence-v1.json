@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "status": "single-pair-screening-evidence",
+  "run_id": "fused16-r7-w131k-b2m-bl256-pair-v2",
+  "claim": "On a non-deadlocking 16-GPU incident-shaped pipeline, the full candidate with admission makes more GPUs available to output-bearing upstream compute and materially reduces end-to-end time.",
+  "arm_scope": {
+    "stock": "base Ray wheel with admission disabled",
+    "admission": "full candidate wheel with atomic shuffle placement-group lifecycle and admission enabled",
+    "causal_scope": "This pair measures the full candidate effect; it does not include a same-candidate, admission-disabled placement-group-only arm."
+  },
+  "configuration": {
+    "physical_gpus": 16,
+    "gpu_model": "Tesla V100-SXM3-32GB-H",
+    "rows": 2000000000,
+    "source_blocks": 256,
+    "gpu_batch_rows": 2097152,
+    "shuffle_ranks": 7,
+    "map_actor_pool": {
+      "min_size": 1,
+      "max_size": 16
+    },
+    "object_store_bytes": 137438953472,
+    "materialize_boundaries": false,
+    "gpu_work": {
+      "kind": "synthetic-output-bearing-fused-uint64-feature-hash",
+      "rounds_per_row": 131072,
+      "input": "original id",
+      "output_use": "transformed id is summed by key",
+      "oracle": "analytic uint64 group sum"
+    }
+  },
+  "provenance": {
+    "base_ray_commit": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+    "candidate_ray_commit": "31d4448482c1a47e034e9160d1d8f41e84cd1a25",
+    "stock_wheel_sha256": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
+    "candidate_wheel_sha256": "e26e04f95572010151f379f044f10f01bcf716bde49caf2688f586781f500309",
+    "staged_harness_sha256": "e1a7cb5e39c4d1f299259db66e0871b6cf70dfef5203454547bc2cd8f5946fb9",
+    "staged_harness_manifest_sha256": "d49b345e992ef53b81415ce280714026b978234f0c9de06097702c77870b52ec",
+    "plan_sha256": "99394cccc8a979d77a5b8bb248831a3a7a461cc88b214c1ddb9b8baabcf973b2"
+  },
+  "results": {
+    "stock": {
+      "elapsed_s": 421.0466699488461,
+      "pipeline_materialize_s": 419.41885049827397,
+      "cluster_gpu_seconds": 6713.371196448803,
+      "owned_gpu_seconds": 4893.58794758562,
+      "mean_cluster_gpu_utilization_pct": 17.251852766798418,
+      "max_sampled_devices_at_least_80_pct_utilization": 3,
+      "upstream_observed_duration_s": 394.9953467492014,
+      "upstream_observed_rows_per_s": 5063350.787445811,
+      "upstream_actors_receiving_input": 3,
+      "premature_downstream_gpu_seconds_lower_bound": 816.083802619949,
+      "workload_sha256": "9fb25366e992c3542e3ac7592ef90b75680c95784594593758f258080efcad18",
+      "execution_sha256": "d14e2104e17476503b3f2ebbb537519cad79ec7a3162e783e731d2694de3af20"
+    },
+    "admission": {
+      "elapsed_s": 160.6309790033847,
+      "pipeline_materialize_s": 159.02657080814242,
+      "cluster_gpu_seconds": 2549.6479166448116,
+      "owned_gpu_seconds": 2217.5474915960804,
+      "mean_cluster_gpu_utilization_pct": 46.119476744186045,
+      "max_sampled_devices_at_least_80_pct_utilization": 9,
+      "upstream_observed_duration_s": 135.51839511841536,
+      "upstream_observed_rows_per_s": 14758144.075218786,
+      "upstream_actors_receiving_input": 9,
+      "premature_downstream_gpu_seconds_lower_bound": 14.570873389020562,
+      "workload_sha256": "548037e54811cd84dee48bb606176922de61aaa3983268442137c11f53315036",
+      "execution_sha256": "ec4e903914904b01427c80d5cb8f1305e33417155243f22e5cff6a378575dfd3"
+    }
+  },
+  "effects": {
+    "stock_elapsed_over_admission": 2.621204655298615,
+    "relative_wall_time_reduction": 0.6184960232011807,
+    "upstream_throughput_ratio": 2.9146991181828583,
+    "cluster_gpu_seconds_reduction": 0.6202134751622987,
+    "premature_downstream_gpu_seconds_lower_bound_reduction": 0.982145371171144,
+    "mean_cluster_gpu_utilization_ratio": 2.6733057235999618
+  },
+  "correctness_and_cleanup": {
+    "output_rows": 64,
+    "output_digest": "138f7ee2b2972574d9237f6babe2659ff09a03df16b6d54c3b38f13152b1027e",
+    "output_schema_hash": "b1190d02af4f5bc8a98e91928c30f9e95e0c06a9512160851b215b5304a16b43",
+    "oracle_kind": "exact-output-bearing-gpu-feature-aggregate",
+    "bytes_spilled": 0,
+    "bytes_restored": 0,
+    "job_cleanup_proven_for_both_arms": true,
+    "cluster_cleanup_proven_for_both_arms": true
+  },
+  "limits": [
+    "This is one randomized paired screening run, so it has no timing confidence interval.",
+    "The fused hash is a synthetic compute-sensitivity calibration, not a claim to model a specific production inference kernel.",
+    "The pair attributes its result to the full candidate with admission, not to admission alone; a same-candidate placement-group-only arm was not run for this sensitivity.",
+    "Premature downstream GPU-seconds are a measured lower bound; elastic-pool expected counts were unavailable and at least one GCS state sample was truncated.",
+    "Cloud and multi-node validation remain open."
+  ]
+}

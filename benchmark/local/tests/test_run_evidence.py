@@ -324,6 +324,20 @@ def test_gpu_map_work_iterations_must_be_nonnegative() -> None:
         )
 
 
+def test_gpu_map_work_iterations_must_fit_cuda_int32() -> None:
+    with pytest.raises(SystemExit):
+        run_evidence.parse_args(
+            [
+                "--run-id",
+                "unit",
+                "--gpu-map-work-iterations",
+                str(1 << 31),
+                "--case-timeout-seconds",
+                "45",
+            ]
+        )
+
+
 def test_materialize_boundaries_are_opt_in() -> None:
     args = run_evidence.parse_args(
         [

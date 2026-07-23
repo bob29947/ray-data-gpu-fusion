@@ -1194,6 +1194,8 @@ def execute_case(
     )
     environment = _overlay_environment(overlay, gpu_indices, harness_root)
     environment["RAY_TMPDIR"] = str(tmp_dir)
+    cupy_cache_dir = case_dir / "cupy-kernel-cache"
+    environment["CUPY_CACHE_DIR"] = str(cupy_cache_dir)
     environment["RAY_DATA_ENABLE_RESOURCE_ADMISSION_CONTROL"] = (
         "1" if ARMS[case.arm].admission_enabled else "0"
     )
@@ -1256,6 +1258,7 @@ def execute_case(
         "artifact": dict(artifact),
         "overlay": str(overlay),
         "ray_tmpdir": str(tmp_dir),
+        "cupy_kernel_cache_dir": str(cupy_cache_dir),
         "ray_spill_directory": str(spill_dir),
         "ray_spill_storage_before_start": spill_storage_before_start,
         "started_at": _utc_now(),
@@ -2989,6 +2992,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"{name.replace('_', '-')} must be positive")
     if args.gpu_map_work_iterations < 0:
         parser.error("gpu-map-work-iterations cannot be negative")
+    if args.gpu_map_work_iterations > (1 << 31) - 1:
+        parser.error("gpu-map-work-iterations exceeds the CUDA int32 limit")
     if args.map_actors_per_stage is not None and args.map_actors_per_stage < 1:
         parser.error("map-actors-per-stage must be positive")
     if args.map_actors_max_per_stage is not None and args.map_actors_max_per_stage < 1:

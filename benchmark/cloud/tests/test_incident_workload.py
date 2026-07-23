@@ -118,6 +118,13 @@ def test_gpu_map_work_iterations_must_be_nonnegative(tmp_path: Path) -> None:
         workload.parse_args(_arguments(tmp_path, "--gpu-map-work-iterations", "-1"))
 
 
+def test_gpu_map_work_iterations_must_fit_cuda_int32(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        workload.parse_args(
+            _arguments(tmp_path, "--gpu-map-work-iterations", str(1 << 31))
+        )
+
+
 def test_materialize_boundaries_are_opt_in(tmp_path: Path) -> None:
     assert not workload.parse_args(_arguments(tmp_path)).materialize_boundaries
     assert workload.parse_args(
@@ -143,6 +150,42 @@ def test_aggregate_cpu_gap_exact_oracle() -> None:
     assert workload._expected_group_output(10, 3, "incident") == baseline
     assert workload._expected_group_output(10, 3, "aggregate-cpu-gap") == {
         key: 2 * value + 1 for key, value in baseline.items()
+    }
+
+
+def test_gpu_map_work_is_part_of_exact_group_oracle() -> None:
+    rows = 10
+    groups = 3
+    iterations = 2
+    baseline = workload._expected_sums(rows, groups)
+    expected = {}
+    for key, value in baseline.items():
+        count = ((rows - 1 - key) // groups) + 1
+        transformed = [
+            workload._gpu_feature_hash_scalar(row, iterations)
+            for row in range(key, rows, groups)
+        ]
+        expected[key] = sum(transformed) & workload._UINT64_MASK
+        assert expected[key] == workload._gpu_feature_group_sum(
+            value, count, iterations
+        )
+
+    assert (
+        workload._expected_group_output(rows, groups, "incident", iterations)
+        == expected
+    )
+    assert expected != baseline
+
+
+def test_native_aggregate_gpu_work_transforms_group_keys() -> None:
+    baseline = workload._expected_sums(rows=10, groups=3)
+    iterations = 2
+
+    assert workload._expected_group_output(10, 3, "aggregate-cpu-gap", iterations) == {
+        workload._gpu_feature_hash_scalar(key, iterations) & workload._UINT32_MASK: 2
+        * value
+        + 1
+        for key, value in baseline.items()
     }
 
 

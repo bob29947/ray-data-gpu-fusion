@@ -138,16 +138,16 @@ class AddKey(_ProgressUdf):
     def __call__(self, batch):
         self._input(batch)
         result = batch.copy(deep=True)
+        keys = result["id"] % self._groups
         if self._gpu_work_iterations:
             import cupy as cp
 
-            scratch = cp.asarray(result["id"].values, dtype=cp.float32)
-            for _ in range(self._gpu_work_iterations):
-                scratch = cp.sin(scratch * cp.float32(1e-6) + cp.float32(0.1))
-            # This benchmark models synchronous GPU preprocessing or inference.
-            # Synchronize so its device work cannot escape the measured UDF stage.
+            work = _gpu_feature_hash(result["id"].values, self._gpu_work_iterations)
+            # Make every input row's calibrated GPU feature the aggregate value.
+            # The exact oracle computes its group sum without enumerating rows.
+            result["id"] = work
             cp.cuda.get_current_stream().synchronize()
-        result["key"] = result["id"] % self._groups
+        result["key"] = keys
         self._record(result)
         return result
 
@@ -172,11 +172,12 @@ class AddKeyColumn(_ProgressUdf):
 
         self._input(values)
         ids = cp.asarray(values.to_numpy(zero_copy_only=False), dtype=cp.int64)
-        if self._gpu_work_iterations:
-            scratch = ids.astype(cp.float32)
-            for _ in range(self._gpu_work_iterations):
-                scratch = cp.sin(scratch * cp.float32(1e-6) + cp.float32(0.1))
         keys = cp.remainder(ids, cp.int64(self._groups))
+        if self._gpu_work_iterations:
+            keys = (
+                _gpu_feature_hash(keys, self._gpu_work_iterations)
+                & cp.uint64(_UINT32_MASK)
+            ).astype(cp.int64)
         result = pa.array(cp.asnumpy(keys))
         self._record(result)
         return result
@@ -1908,6 +1909,63 @@ def _resource_metrics(
     }
 
 
+_GPU_FEATURE_MULTIPLIER = 1_664_525
+_GPU_FEATURE_INCREMENT = 1_013_904_223
+_UINT32_MASK = (1 << 32) - 1
+_INT32_MAX = (1 << 31) - 1
+_GPU_FEATURE_KERNEL = None
+
+
+def _gpu_feature_hash(values: object, iterations: int):
+    """Run deterministic output-bearing GPU feature-engineering rounds."""
+
+    import cupy as cp
+
+    global _GPU_FEATURE_KERNEL
+    if _GPU_FEATURE_KERNEL is None:
+        _GPU_FEATURE_KERNEL = cp.ElementwiseKernel(
+            "uint64 base, int32 iterations",
+            "uint64 work",
+            """
+            work = base;
+            for (int round = 0; round < iterations; ++round) {
+                work = work * 1664525ULL + 1013904223ULL + base;
+            }
+            """,
+            "ray_data_evidence_gpu_feature_hash",
+        )
+    base = cp.asarray(values, dtype=cp.uint64)
+    return _GPU_FEATURE_KERNEL(base, cp.int32(iterations))
+
+
+def _gpu_feature_hash_scalar(value: int, iterations: int) -> int:
+    base = value & _UINT64_MASK
+    work = base
+    for _ in range(iterations):
+        work = (
+            work * _GPU_FEATURE_MULTIPLIER + _GPU_FEATURE_INCREMENT + base
+        ) & _UINT64_MASK
+    return work
+
+
+def _gpu_feature_group_sum(
+    input_sum: int,
+    count: int,
+    iterations: int,
+) -> int:
+    """Compute the uint64 sum of transformed rows without enumerating them."""
+
+    base_sum = input_sum & _UINT64_MASK
+    work_sum = base_sum
+    for _ in range(iterations):
+        work_sum = (
+            work_sum * _GPU_FEATURE_MULTIPLIER
+            + count * _GPU_FEATURE_INCREMENT
+            + base_sum
+        ) & _UINT64_MASK
+    return work_sum
+
+
 def _expected_sums(rows: int, groups: int) -> dict[int, int]:
     expected = {}
     for key in range(min(rows, groups)):
@@ -1916,10 +1974,31 @@ def _expected_sums(rows: int, groups: int) -> dict[int, int]:
     return expected
 
 
-def _expected_group_output(rows: int, groups: int, workload: str) -> dict[int, int]:
+def _expected_group_output(
+    rows: int,
+    groups: int,
+    workload: str,
+    gpu_work_iterations: int = 0,
+) -> dict[int, int]:
     expected = _expected_sums(rows, groups)
     if workload == "aggregate-cpu-gap":
+        if gpu_work_iterations:
+            expected = {
+                _gpu_feature_hash_scalar(key, gpu_work_iterations) & _UINT32_MASK: value
+                for key, value in expected.items()
+            }
+            if len(expected) != min(rows, groups):
+                raise AssertionError("GPU feature hash collided across aggregate keys")
         return {key: 2 * value + 1 for key, value in expected.items()}
+    if gpu_work_iterations:
+        expected = {
+            key: _gpu_feature_group_sum(
+                value,
+                ((rows - 1 - key) // groups) + 1,
+                gpu_work_iterations,
+            )
+            for key, value in expected.items()
+        }
     return expected
 
 
@@ -2197,6 +2276,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--sample-interval-seconds must be positive")
     if args.gpu_map_work_iterations < 0:
         parser.error("--gpu-map-work-iterations cannot be negative")
+    if args.gpu_map_work_iterations > _INT32_MAX:
+        parser.error("--gpu-map-work-iterations exceeds the CUDA int32 limit")
     return args
 
 
@@ -2456,6 +2537,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "groups": args.groups,
         "batch_size": args.batch_size,
         "gpu_map_work_iterations": args.gpu_map_work_iterations,
+        "gpu_map_work_kernel": (
+            "fused-output-bearing-feature-hash"
+            if args.gpu_map_work_iterations
+            else None
+        ),
+        "gpu_map_work_output_bearing": bool(args.gpu_map_work_iterations)
+        and args.workload
+        in {
+            "incident",
+            "shuffle-heavy",
+            "forced-spill",
+            "aggregate-cpu-gap",
+        },
         "materialize_boundaries": args.materialize_boundaries,
         "forced_spill_requires_cluster_object_store_cap": args.workload
         == "forced-spill",
@@ -2630,7 +2724,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if oracle in {"group-sum", "scaled-group-sum"}:
             output = materialized.take_all()
             actual = _unique_group_output(output)
-            expected = _expected_group_output(args.rows, args.groups, args.workload)
+            expected = _expected_group_output(
+                args.rows,
+                args.groups,
+                args.workload,
+                args.gpu_map_work_iterations,
+            )
             if actual != expected:
                 raise AssertionError(
                     f"aggregate oracle mismatch: expected {expected}, got {actual}"
@@ -2639,9 +2738,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_digest = _output_digest(output)
             content_oracle = {
                 "kind": (
-                    "exact-scaled-group-sum"
+                    "exact-output-bearing-gpu-feature-scaled-aggregate"
+                    if oracle == "scaled-group-sum" and args.gpu_map_work_iterations
+                    else "exact-scaled-group-sum"
                     if oracle == "scaled-group-sum"
-                    else "exact-group-sum"
+                    else (
+                        "exact-output-bearing-gpu-feature-aggregate"
+                        if args.gpu_map_work_iterations
+                        else "exact-group-sum"
+                    )
                 ),
                 "sha256": output_digest,
             }

@@ -128,6 +128,59 @@ Admission therefore improves more than liveness on equal hardware:
 - within each workload, every completing arm produces the same rows, schema,
   and deterministic content hash.
 
+#### Compute-heavy sensitivity on the same non-deadlocking shape
+
+A second paired run makes the upstream GPU map deliberately compute-bound
+without changing the operator DAG, actor-pool bounds, or shuffle rank. It uses
+the same 16 V100 GPUs and two billion rows as the ordinary large-scale control,
+but uses 256 larger source blocks and 2,097,152-row GPU batches. A fused,
+deterministic uint64 feature hash performs 131,072 dependent rounds on every
+original row ID; the transformed value is then summed by key. The GPU result is
+therefore part of the final answer, and an analytic CPU group-sum oracle detects
+skipped or incorrect work.
+
+Both arms use GPUs 0-15 and the same rows, blocks, batch size, shuffle rank,
+actor-pool bounds, 128 GiB object store, and sampling interval. The intended
+arm differences are the stock-versus-candidate Ray wheel and admission flag;
+the candidate arm therefore includes both the atomic shuffle placement-group
+lifecycle and admission. Each arm starts with its own empty CuPy kernel-cache
+directory.
+
+| Metric | Stock | Full candidate with admission | Effect |
+| --- | ---: | ---: | ---: |
+| End-to-end elapsed | 421.047 s | 160.631 s | **2.62x throughput; 61.8% less time** |
+| Observed upstream duration | 394.995 s | 135.518 s | **2.91x throughput** |
+| Upstream actors receiving input | 3 | 9 | **3x as many useful actors** |
+| Mean utilization across the 16 GPUs | 17.25% | 46.12% | **2.67x** |
+| Cluster-capacity GPU-seconds | 6,713.371 | 2,549.648 | **62.0% lower** |
+| Premature downstream GPU-seconds | 816.084 | 14.571 | **98.2% lower bound reduction** |
+
+The sampled-device evidence matches the actor evidence: the maximum number of
+GPUs simultaneously observed at or above 80% utilization is three for stock
+and nine for admission. Stock's terminal GPU actor is ready 412.112 seconds
+before its first usable input; admission reduces that interval to 8.934
+seconds.
+
+Both arms produce the same 64 rows, schema hash, and exact output digest. Both
+spill and restore zero bytes and prove job and cluster cleanup. Ray Data's
+operator statistics independently report that `MapBatches(AddKey)` falls from
+396.50 to 139.38 seconds, consistent with the progress telemetry.
+
+This is an output-bearing synthetic compute-sensitivity test, not a claim that
+the hash models a particular inference or preprocessing kernel. Its purpose is
+to isolate the scheduling consequence when the premature owners take GPUs away
+from expensive useful work. It is one randomized paired run, so the numbers are
+point estimates without a confidence interval. The premature-ownership values
+remain measured lower bounds because elastic-pool expected counts are
+unavailable and some GCS state snapshots were truncated. The three-versus-nine
+actor count includes actors with an acknowledged first input and is likewise
+an observed lower bound, not a census of attempted actor creations. This pair
+proves the full candidate's effect, not an admission-only causal estimate,
+because it has no same-candidate, admission-disabled placement-group arm. The
+ordinary controls above provide that separate placement-group comparison. The
+calibration adds benchmark code only; the Ray production candidate and its
+production-NCLOC count are unchanged.
+
 These are one-run DGX screening results. They establish the failure mechanism
 and a performance direction; the hardened provenance refresh, scaling curve,
 cloud autoscaling run, and final correctness matrix remain merge gates.
@@ -150,9 +203,9 @@ actor-only control has a measured 3.4% admission regression.
 
 | Existing approach | What it can solve | Evidence relative to admission | Why it is not sufficient |
 | --- | --- | --- | --- |
-| Current Core scheduling and proportional Ray Data allocation | Places valid individual requests and shares throughput budgets | Stock deadlocks at 4 GPUs; admission cuts wall time by 8.8-25.8% on the two 16-GPU controls | Neither layer infers DAG progress floors before eager acquisition |
+| Current Core scheduling and proportional Ray Data allocation | Places valid individual requests and shares throughput budgets | Stock deadlocks at 4 GPUs; admission cuts wall time by 8.8-25.8% on the two ordinary 16-GPU controls, while the full candidate cuts it by 61.8% in the output-bearing compute sensitivity | Neither layer infers DAG progress floors before eager acquisition |
 | Atomic placement groups | Prevents partial shuffle-gang acquisition | PG-only still deadlocks in both 4-GPU shapes; admission cuts wall time by 3.2-9.2% when both complete | Atomicity answers “all ranks together,” not “which stage owns GPUs now” |
-| Autoscaling or overprovisioning | Adds GPUs for pending feasible requests | Fixed-capacity evidence only; cloud comparison open. At a configured ceiling the measured cycles remain; on an already sufficient 16-GPU host admission uses fewer cluster-capacity GPU-seconds | Capacity supply does not order owners, and enough capacity for every eager stage is an expensive workaround |
+| Autoscaling or overprovisioning | Adds GPUs for pending feasible requests | Fixed-capacity evidence only; cloud comparison open. At a configured ceiling the measured cycles remain; on an already sufficient 16-GPU host admission uses 9.8-25.7% fewer cluster-capacity GPU-seconds on the ordinary controls, and the full candidate uses 62.0% fewer in the compute sensitivity | Capacity supply does not order owners, and enough capacity for every eager stage is an expensive workaround |
 | Lower shuffle rank or actor-pool sizes | Can make one small shape fit | Stock rank 1 completes the small control, but the scaled rank-1 control OOMs; the actor-only cycle has no rank to tune. Best completing stock-rank sweep remains open | There is no workload-independent safe rank, and pools already at `min_size=1` can still participate in the cycle |
 | Explicit `materialize()` boundaries | Breaks a known cycle into phases | Essentially tied at 4 GPUs; admission cuts wall time by 4.7% and 17.4% on the two large no-spill controls | Requires DAG-specific surgery, loses streaming overlap, and cannot split inside a fused/grouped operator |
 | Object spilling | Relieves object-store pressure while Arrow blocks queue | The 16-GPU headline controls do not spill, yet stock is slower; spilling does not revoke an actor or order the next GPU owner | Storage pressure and GPU ownership are different problems; admission still reuses Ray's spiller |
@@ -169,7 +222,9 @@ backpressured, and when an owner can release.
 Stock Ray enters a certified closed wait on the native-aggregate shape. When it
 does complete at 16 GPUs, admission reduces wall time by 25.8% on the
 incident-derived workload and 8.8% on the native-aggregate workload with the
-same ranks, data, and hardware.
+same ranks, data, and hardware. When the incident-derived upstream map is made
+compute-bound, the full candidate with admission raises the observed useful
+upstream actor count from three to nine and reduces end-to-end time by 61.8%.
 
 Conclusion: existing Core scheduling is the correct placement mechanism, but
 it cannot by itself guarantee liveness for these Ray Data DAGs. Admission
@@ -204,7 +259,10 @@ Overprovisioning until every eagerly created stage fits can avoid the cycle, but
 that makes aggregate concurrent stage demand—not useful work—the required fleet
 size. The non-deadlocking 16-GPU results show the remaining cost: on identical
 capacity, admission reduces cluster-capacity GPU-seconds by 25.7% and 9.8%
-versus stock on the two workloads.
+versus stock on the two ordinary workloads; the full candidate with admission
+reduces it by 62.0% in the compute-heavy sensitivity. Autoscaling to the same
+16-GPU ceiling cannot recover that loss: the GPUs already exist, but stock has
+assigned or exposed too few of them to the useful upstream bottleneck.
 
 Code inspection shows another coupling.
 `execution/operators/hash_shuffle.py::_get_total_cluster_resources()` uses the
@@ -800,6 +858,10 @@ fixed-capacity cases.
 The native-aggregate admission and PG-only measurements were captured from the
 exact current candidate and wheel pinned above. The stock and
 materialized-stock controls use the base Ray wheel recorded in their manifests.
+The compute-heavy pair also uses the exact current candidate and base wheels.
+Its staged harness content hash is
+`e1a7cb5e39c4d1f299259db66e0871b6cf70dfef5203454547bc2cd8f5946fb9`;
+each arm uses a separate empty CuPy kernel-cache directory.
 The hardened harness now persists and validates the complete optimized physical
 layout before terminal execution; manual-boundary controls checkpoint each
 phase plan before blocking materialization. A completing run must also report
@@ -829,7 +891,12 @@ Correctness and cleanup are checked independently of timing:
 - all four 16-GPU native-aggregate arms produce 64 exact rows, content digest
   `13e02773a8544941f3e39369b44c183b0faca84799bee0ba1c5fb89d5a40e9a6`,
   and the same schema hash. The two completing four-GPU arms also pass the exact
-  per-key oracle and match each other; and
+  per-key oracle and match each other;
+- both compute-heavy arms produce 64 exact rows, content digest
+  `138f7ee2b2972574d9237f6babe2659ff09a03df16b6d54c3b38f13152b1027e`,
+  and schema hash
+  `b1190d02af4f5bc8a98e91928c30f9e95e0c06a9512160851b215b5304a16b43`;
+  and
 - every headline job and isolated cluster proves cleanup. The 16-GPU headline
   runs report no spill or restore.
 
@@ -852,7 +919,11 @@ Raw artifact index:
 - rank and actor-pool controls:
   `benchmark/results/local/stock-workaround-16m-20260722a`,
   `benchmark/results/local/perf4-1b-v1`, and
-  `benchmark/results/local/local-multigpu-actor-baseline-20260722a`; and
+  `benchmark/results/local/local-multigpu-actor-baseline-20260722a`;
+- output-bearing compute sensitivity:
+  `benchmark/results/local/fused16-r7-w131k-b2m-bl256-pair-v2`, summarized by
+  `benchmark/review_artifacts/compute-heavy-evidence-v1.json` and preserved in
+  `benchmark/review_artifacts/dgx-compute-heavy-v1.tar.gz`;
 - forced-spill controls:
   `benchmark/results/local/perf16-2b-16g-stock-mat-r7-w0-v1`,
   `benchmark/results/local/perf16-2b-16g-min-r7-w0-v3`, and
