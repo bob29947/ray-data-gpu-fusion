@@ -1,0 +1,232 @@
+{
+  "actor_only_regression": {
+    "comparison": {
+      "baseline": {
+        "max": 45.6101415771991,
+        "median": 45.6101415771991,
+        "median_absolute_deviation": 0.0,
+        "median_ci": {
+          "actual_samples": 1,
+          "completed_resamples": 0,
+          "confidence_level": 0.95,
+          "lower": null,
+          "method": "percentile_bootstrap_median",
+          "minimum_samples": 5,
+          "reason": "at least 5 samples are required for a confidence interval",
+          "requested_resamples": 10000,
+          "status": "insufficient_samples",
+          "upper": null
+        },
+        "min": 45.6101415771991,
+        "samples": 1
+      },
+      "candidate": {
+        "max": 47.107815720140934,
+        "median": 47.107815720140934,
+        "median_absolute_deviation": 0.0,
+        "median_ci": {
+          "actual_samples": 1,
+          "completed_resamples": 0,
+          "confidence_level": 0.95,
+          "lower": null,
+          "method": "percentile_bootstrap_median",
+          "minimum_samples": 5,
+          "reason": "at least 5 samples are required for a confidence interval",
+          "requested_resamples": 10000,
+          "status": "insufficient_samples",
+          "upper": null
+        },
+        "min": 47.107815720140934,
+        "samples": 1
+      },
+      "direction": "lower_is_better",
+      "effects": {
+        "baseline_minus_candidate": {
+          "ci": {
+            "actual_samples": 1,
+            "completed_resamples": 0,
+            "confidence_level": 0.95,
+            "lower": null,
+            "method": "percentile_bootstrap_median",
+            "minimum_samples": 5,
+            "reason": "at least 5 samples are required for a confidence interval",
+            "requested_resamples": 10000,
+            "status": "insufficient_samples",
+            "upper": null
+          },
+          "estimate": -1.4976741429418325,
+          "estimate_kind": "median_of_paired_differences",
+          "max": -1.4976741429418325,
+          "median_absolute_deviation": 0.0,
+          "min": -1.4976741429418325,
+          "samples": 1
+        },
+        "baseline_over_candidate": {
+          "ci": {
+            "actual_samples": 1,
+            "completed_resamples": 0,
+            "confidence_level": 0.95,
+            "lower": null,
+            "method": "percentile_bootstrap_median",
+            "minimum_samples": 5,
+            "reason": "at least 5 samples are required for a confidence interval",
+            "requested_resamples": 10000,
+            "status": "insufficient_samples",
+            "upper": null
+          },
+          "estimate": 0.9682075231031886,
+          "estimate_kind": "median_of_paired_ratios",
+          "max": 0.9682075231031886,
+          "median_absolute_deviation": 0.0,
+          "min": 0.9682075231031886,
+          "samples": 1
+        },
+        "relative_time_reduction": {
+          "ci": {
+            "actual_samples": 1,
+            "completed_resamples": 0,
+            "confidence_level": 0.95,
+            "lower": null,
+            "method": "percentile_bootstrap_median",
+            "minimum_samples": 5,
+            "reason": "at least 5 samples are required for a confidence interval",
+            "requested_resamples": 10000,
+            "status": "insufficient_samples",
+            "upper": null
+          },
+          "estimate": -0.032836428284417574,
+          "estimate_kind": "median_of_paired_reductions",
+          "max": -0.032836428284417574,
+          "median_absolute_deviation": 0.0,
+          "min": -0.032836428284417574,
+          "samples": 1
+        }
+      },
+      "mode": "paired_by_repetition",
+      "pairing": {
+        "key": "repetition",
+        "paired_runs": 1,
+        "reason_unpaired": null
+      },
+      "per_repetition": [
+        {
+          "baseline": 45.6101415771991,
+          "baseline_minus_candidate": -1.4976741429418325,
+          "baseline_over_candidate": 0.9682075231031886,
+          "candidate": 47.107815720140934,
+          "relative_time_reduction": -0.032836428284417574,
+          "repetition": 1
+        }
+      ],
+      "schema_version": 1,
+      "value_key": "elapsed_s"
+    },
+    "confidence_supported": null,
+    "decision_basis": "point_estimate",
+    "effective_samples": 1,
+    "gate": "maximum_normal_workload_regression",
+    "maximum_regression": 0.05,
+    "minimum_runs": 5,
+    "observed_regression": 0.032836428284417574,
+    "observed_relative_time_reduction": -0.032836428284417574,
+    "passed": null,
+    "point_estimate_passed": true,
+    "required_relative_time_reduction": -0.05,
+    "status": "insufficient_samples"
+  },
+  "blockers": [
+    "all_planned_cases_completed",
+    "cross_configuration_correctness_agreement",
+    "incident_at_least_10_percent_faster",
+    "equal_shape_actor_only_regression_at_most_5_percent"
+  ],
+  "comparison_contract": {
+    "actor_only_equal_shape": {
+      "arms": [
+        "stock",
+        "minimal"
+      ],
+      "capacity": 4,
+      "map_actors_per_stage": 1,
+      "safety_constraint": "3 * map_actors_per_stage <= capacity",
+      "shuffle_ranks": "default"
+    },
+    "incident_candidate": {
+      "arm": "minimal",
+      "capacity": 4,
+      "map_actors_per_stage": 4,
+      "shuffle_ranks": 4
+    },
+    "incident_stock_workaround": {
+      "arm": "stock",
+      "capacity": 4,
+      "map_actors_per_stage": 1,
+      "shuffle_ranks": 1
+    }
+  },
+  "completion_counts": {
+    "candidate_actor_only": 1,
+    "candidate_incident": 1,
+    "stock_actor_only": 1,
+    "stock_incident": 0
+  },
+  "correctness_groups": [
+    {
+      "agreement": true,
+      "arms": [
+        "minimal",
+        "stock"
+      ],
+      "comparison_id": "actor-only-regression",
+      "complete_oracles": true,
+      "oracles": [
+        [
+          1000000000,
+          "b876c98883fe75e45c9af7bbaa407fc560c47b53a9522049fe143bd8f25b9c9c",
+          "1da2a92ef54c7f5f65bed95ca5ef2d1d28539829484f195851a53c64468e5f0e"
+        ]
+      ],
+      "repetition": 1
+    },
+    {
+      "agreement": false,
+      "arms": [
+        "minimal"
+      ],
+      "comparison_id": "incident-scale-speedup",
+      "complete_oracles": true,
+      "oracles": [
+        [
+          64,
+          "e970ea10b5b479c42a961541e65e56984196c60341a0c61cc59e4c7b26679b83",
+          "cac69f47b621f85b4c7600f976733208d1b159eda3fa157ec45aaa54b97d276c"
+        ]
+      ],
+      "repetition": 1
+    }
+  ],
+  "expected_cases": 4,
+  "gates": {
+    "all_job_and_cluster_cleanup_proven": true,
+    "all_planned_cases_completed": false,
+    "cross_configuration_correctness_agreement": false,
+    "equal_shape_actor_only_regression_at_most_5_percent": false,
+    "executed": true,
+    "incident_at_least_10_percent_faster": false
+  },
+  "incident_speedup": {
+    "best_stock_workaround": null,
+    "comparison": null,
+    "excluded_stock_workarounds": [
+      "map-actors-1_shuffle-rank-1"
+    ],
+    "gate": "speedup_vs_best_completing_stock",
+    "passed": null,
+    "status": "no_completing_stock_workaround",
+    "stock_medians": {}
+  },
+  "planned_repetitions": 1,
+  "profile": "scale",
+  "schema_version": 1,
+  "status": "fail"
+}

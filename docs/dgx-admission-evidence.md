@@ -551,13 +551,15 @@ cost is intentionally capped and reuses existing Core and Ray Data mechanisms.
 
 The future-fusion workload, plan guard, oracle hardening, launcher registration,
 tests, and this report add no Ray production LOC. The LOC artifact is
-`benchmark/results/local/candidate-loc-final-31d444.json`.
+[`benchmark/review_artifacts/candidate-loc-final-31d444.json`](../benchmark/review_artifacts/candidate-loc-final-31d444.json).
 
 `benchmark/results/` is intentionally gitignored because full logs, isolated
-runtimes, and telemetry are large. Before review, export the cited workload,
-execution, cleanup, manifest, and plan JSON files as a compact attached
-artifact (or a separately published evidence bundle); the checked-in report
-alone is not a substitute for those raw records.
+runtimes, and spill data are large. The original JSON records cited by this
+report are committed as the compact
+[`benchmark/review_artifacts/dgx-screening-v1.tar.gz`](../benchmark/review_artifacts/dgx-screening-v1.tar.gz)
+bundle. Its [review index](../benchmark/review_artifacts/README.md) maps each
+claim to the corresponding experiment and records the archive checksum and
+provenance limitations.
 
 ## Merge decision and remaining evidence
 
