@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VENV = (ROOT / ".venv").resolve()
 CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-minimal"
-CANDIDATE_BRANCH = "codex/gpu-admission-minimal"
+CANDIDATE_BRANCH = "gpu-admission-minimal"
 TEST_RAY_ROOT = CANDIDATE_WORKTREE / "python" / "ray"
 BOOTSTRAP = ROOT / "scripts" / "ray_acceptance_bootstrap"
 

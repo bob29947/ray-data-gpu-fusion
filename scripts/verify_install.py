@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_WORKTREE = ROOT / ".worktrees" / "ray-pr-minimal"
-CANDIDATE_BRANCH = "codex/gpu-admission-minimal"
+CANDIDATE_BRANCH = "gpu-admission-minimal"
 CANDIDATE_SUBJECT = "[Data] Add generic resource admission for GPU operators"
 CANDIDATE_PATCH = Path(
     "ray-pr-candidate/0001-ray-data-generic-resource-admission.patch"
